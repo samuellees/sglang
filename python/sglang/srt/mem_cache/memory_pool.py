@@ -52,7 +52,7 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_buffer_triton,
     set_mla_kv_scale_buffer_triton,
 )
-from sglang.srt.utils import is_cuda, is_npu, next_power_of_2
+from sglang.srt.utils import is_cuda, is_float4_e2m1fn_x2, is_npu, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -909,6 +909,43 @@ class MHATokenToKVPool(KVCache):
         )
 
 
+class FP8TemporaryBufferPool:
+    """Temporary FP8 buffer pool for prefill attention computation."""
+
+    def __init__(
+        self,
+        max_buffer_size: int,
+        num_layers: int,
+        num_kv_heads: int,
+        head_dim: int,
+        device: str,
+    ):
+        self.max_buffer_size = max_buffer_size
+        self.num_layers = num_layers
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.device = device
+
+        # shape: [num_layers, max_seq_len, num_kv_heads, head_dim]
+        self.k_fp8_buffer = torch.empty(
+            (num_layers, max_buffer_size, num_kv_heads, head_dim),
+            dtype=torch.float8_e4m3fn,
+            device=device,
+        )
+        self.v_fp8_buffer = torch.empty(
+            (num_layers, max_buffer_size, num_kv_heads, head_dim),
+            dtype=torch.float8_e4m3fn,
+            device=device,
+        )
+
+    def get_buffer_slice(self, layer_id: int, seq_len: int):
+        """Get FP8 buffer slice for current sequence length."""
+        return (
+            self.k_fp8_buffer[layer_id, :seq_len],
+            self.v_fp8_buffer[layer_id, :seq_len],
+        )
+
+
 class MHATokenToKVPoolFP4(MHATokenToKVPool):
 
     def _create_buffers(self):
@@ -960,12 +997,35 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
                     for _ in range(self.layer_num)
                 ]
 
+        # self.fp8_temporary_buffer_pool = FP8TemporaryBufferPool(
+        #     max_buffer_size=128*1024,  # 128K tokens
+        #     num_layers=self.layer_num,
+        #     num_kv_heads=self.head_num,
+        #     head_dim=self.head_dim,
+        #     device=self.device,
+        # )
+
     def _clear_buffers(self):
         del self.k_buffer
         del self.v_buffer
         del self.k_scale_buffer
         del self.v_scale_buffer
 
+    def _get_key_nvfp4_from_nvfp4_buffer(self, layer_id: int):
+        return (
+            self.k_buffer[layer_id - self.start_layer],
+            self.k_scale_buffer[layer_id - self.start_layer],
+        )
+
+    def _get_value_nvfp4_from_nvfp4_buffer(self, layer_id: int):
+        return (
+            self.v_buffer[layer_id - self.start_layer],
+            self.v_scale_buffer[layer_id - self.start_layer],
+        )
+
+    # Load fp4 kv cache
+    # Dequant fp4 kv cache to fp8
+    # return fp8 kv cache
     def _get_key_buffer(self, layer_id: int):
         # for internal use of referencing
         if self.store_dtype != self.dtype:
@@ -976,12 +1036,17 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
 
             from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
 
+            # import ipdb; ipdb.set_trace()
+            # print(f"{cache_k_nope_fp4.shape=}, {cache_k_nope_fp4_sf.shape=}")
             cache_k_nope_fp4_dequant = KVFP4QuantizeUtil.batched_dequantize(
                 cache_k_nope_fp4, cache_k_nope_fp4_sf
             )
             return cache_k_nope_fp4_dequant
         return self.k_buffer[layer_id - self.start_layer]
 
+    # Load fp4 kv cache
+    # Dequant fp4 kv cache to fp8
+    # return fp8 kv cache
     def _get_value_buffer(self, layer_id: int):
         # for internal use of referencing
         if self.store_dtype != self.dtype:
@@ -998,6 +1063,9 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             return cache_v_nope_fp4_dequant
         return self.v_buffer[layer_id - self.start_layer]
 
+    # Accept fp8/bf16 kvcache
+    # Quantize into fp4
+    # Save into fp4 cache pool
     def set_kv_buffer(
         self,
         layer: RadixAttention,
@@ -1087,9 +1155,15 @@ class HybridLinearKVPool(KVCache):
         self.use_mla = use_mla
         if not use_mla:
 
-            TokenToKVPoolClass = MHATokenToKVPool
+            if is_float4_e2m1fn_x2(dtype):
+                TokenToKVPoolClass = MHATokenToKVPoolFP4
+            else:
+                TokenToKVPoolClass = MHATokenToKVPool
 
             if _is_npu:
+                assert not is_float4_e2m1fn_x2(
+                    dtype
+                ), "FP4 is not supported on NPU yet."
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                     NPUMHATokenToKVPool,
                 )
@@ -1169,6 +1243,14 @@ class HybridLinearKVPool(KVCache):
     def get_kv_buffer(self, layer_id: int):
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_kv_buffer(layer_id)
+
+    def get_fp4_value_buffer(self, layer_id: int):
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool._get_value_nvfp4_from_nvfp4_buffer(layer_id)
+
+    def get_fp4_key_buffer(self, layer_id: int):
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool._get_key_nvfp4_from_nvfp4_buffer(layer_id)
 
     @contextmanager
     def _transfer_id_context(self, layer: RadixAttention):

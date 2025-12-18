@@ -578,6 +578,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
 
+        # nvfp4 kv cache path using origin fake nvfp4 path here
+
         if use_fused_fp8_path:
             # Use fused FP8 quantization + KV cache write path
             self._fused_fp8_set_kv_buffer(
@@ -655,7 +657,259 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
 
-        if use_fused_fp8_path:
+        nvfp4_kvcache_path = self.data_type == torch.float4_e2m1fn_x2
+        # nvfp4_kvcache_path = False
+        logger.debug(f"q.dtype={q.dtype}, k.dtype={k.dtype}, v.dtype={v.dtype}")
+
+        if nvfp4_kvcache_path:
+            assert (
+                not forward_batch.forward_mode.is_target_verify()
+            ), "only prefill for now"
+            # assert self.data_type == torch.float8_e4m3fn, "only fp8 kv cache for now"
+
+            logger.debug(
+                f"[NVFP4 Path] batch_size={forward_batch.batch_size}, "
+                f"extend_seq_lens={forward_batch.extend_seq_lens.tolist()}, "
+                f"seq_lens={forward_batch.seq_lens.tolist()}"
+            )
+
+            prefix_lens = (
+                forward_batch.seq_lens - forward_batch.extend_seq_lens
+            )  # previous length
+            batch_size = forward_batch.batch_size
+
+            k_prev_fp8_list = []
+            v_prev_fp8_list = []
+            k_buffer_nvfp4, k_scales_buffer = (
+                forward_batch.token_to_kv_pool.get_fp4_key_buffer(layer.layer_id)
+            )
+            v_buffer_nvfp4, v_scales_buffer = (
+                forward_batch.token_to_kv_pool.get_fp4_value_buffer(layer.layer_id)
+            )
+
+            logger.debug(
+                f"[NVFP4 Path] k_buffer_nvfp4.shape={k_buffer_nvfp4.shape}, "
+                f"k_scales_buffer.shape={k_scales_buffer.shape}"
+            )
+
+            for batch_idx in range(batch_size):
+                req_pool_idx = forward_batch.req_pool_indices[batch_idx].item()
+                prev_len = prefix_lens[batch_idx].item()
+
+                logger.debug(
+                    f"[NVFP4 Path] batch_idx={batch_idx}, req_pool_idx={req_pool_idx}, prev_len={prev_len}"
+                )
+
+                if prev_len > 0:
+                    prev_token_indices = forward_batch.req_to_token_pool.req_to_token[
+                        req_pool_idx, :prev_len
+                    ]
+
+                    # Gather nvfp4 KV from paged buffer
+                    k_prev_nvfp4 = k_buffer_nvfp4[
+                        prev_token_indices
+                    ]  # [prev_len, num_heads, head_dim/2]
+                    k_prev_scales = k_scales_buffer[
+                        prev_token_indices
+                    ]  # [prev_len, ...]
+                    v_prev_nvfp4 = v_buffer_nvfp4[prev_token_indices]
+                    v_prev_scales = v_scales_buffer[prev_token_indices]
+
+                    logger.debug(
+                        f"[NVFP4 Path] batch_idx={batch_idx}, k_prev_nvfp4.shape={k_prev_nvfp4.shape}, "
+                        f"k_prev_scales.shape={k_prev_scales.shape}"
+                    )
+
+                    from sglang.srt.layers.quantization.kvfp4_tensor import (
+                        KVFP4QuantizeUtil,
+                    )
+
+                    k_prev_bf16 = KVFP4QuantizeUtil.batched_dequantize(
+                        k_prev_nvfp4.view(torch.uint8), k_prev_scales.view(torch.uint8)
+                    )
+                    v_prev_bf16 = KVFP4QuantizeUtil.batched_dequantize(
+                        v_prev_nvfp4.view(torch.uint8), v_prev_scales.view(torch.uint8)
+                    )
+                    logger.debug(
+                        f"[NVFP4 Path] batch_idx={batch_idx}, dequantized k_prev_bf16.shape={k_prev_bf16.shape}"
+                    )
+
+                    # bf16 -> fp8
+                    k_prev_fp8_list.append(k_prev_bf16.to(torch.float8_e4m3fn))
+                    v_prev_fp8_list.append(v_prev_bf16.to(torch.float8_e4m3fn))
+                else:
+                    # add empty tensor
+                    logger.debug(
+                        f"[NVFP4 Path] batch_idx={batch_idx}, no previous tokens, creating empty tensor"
+                    )
+                    k_prev_fp8_list.append(
+                        torch.empty(
+                            0,
+                            k.shape[1],
+                            k.shape[2],
+                            dtype=torch.float8_e4m3fn,
+                            device=k.device,
+                        )
+                    )
+                    v_prev_fp8_list.append(
+                        torch.empty(
+                            0,
+                            v.shape[1],
+                            v.shape[2],
+                            dtype=torch.float8_e4m3fn,
+                            device=v.device,
+                        )
+                    )
+
+            # convert to fp8
+            k_cur_fp8 = k.to(torch.float8_e4m3fn)
+            v_cur_fp8 = v.to(torch.float8_e4m3fn)
+
+            logger.debug(
+                f"[NVFP4 Path] k_cur_fp8.shape={k_cur_fp8.shape}, v_cur_fp8.shape={v_cur_fp8.shape}"
+            )
+
+            # Write current bf16 chunk to nvfp4 buffer
+            logger.debug(
+                f"[NVFP4 Path] Writing current chunk to nvfp4 buffer, k.shape={k.shape}, v.shape={v.shape}"
+            )
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer=layer,
+                loc=cache_loc,
+                cache_k=k,
+                cache_v=v,
+                k_scale=layer.k_scale if hasattr(layer, "k_scale") else None,
+                v_scale=layer.v_scale if hasattr(layer, "v_scale") else None,
+            )
+            logger.debug(f"[NVFP4 Path] Current chunk written to nvfp4 buffer")
+
+            # Split current chunk by batch
+            extend_lens_list = forward_batch.extend_seq_lens.tolist()
+            k_cur_split = torch.split(k_cur_fp8, extend_lens_list, dim=0)
+            v_cur_split = torch.split(v_cur_fp8, extend_lens_list, dim=0)
+
+            # Concatenate per request: previous + current
+            k_full_list = [
+                torch.cat([k_prev, k_cur], dim=0)
+                for k_prev, k_cur in zip(k_prev_fp8_list, k_cur_split)
+            ]
+            v_full_list = [
+                torch.cat([v_prev, v_cur], dim=0)
+                for v_prev, v_cur in zip(v_prev_fp8_list, v_cur_split)
+            ]
+
+            # Calculate total pages needed for temporary paged buffer
+            full_lens = [kv.shape[0] for kv in k_full_list]
+            pages_per_req = [
+                (seq_len + self.page_size - 1) // self.page_size
+                for seq_len in full_lens
+            ]
+            total_pages = sum(pages_per_req)
+
+            logger.debug(
+                f"[NVFP4 Path] full_lens={full_lens}, pages_per_req={pages_per_req}, total_pages={total_pages}"
+            )
+
+            # Allocate temporary paged buffer
+            # [num_pages, num_kv_heads, page_size, head_dim]
+            k_temp_paged = torch.zeros(
+                total_pages,
+                layer.tp_k_head_num,
+                self.page_size,
+                layer.head_dim,
+                dtype=torch.float8_e4m3fn,
+                device=k.device,
+            )
+            v_temp_paged = torch.zeros(
+                total_pages,
+                layer.tp_v_head_num,
+                self.page_size,
+                layer.head_dim,
+                dtype=torch.float8_e4m3fn,
+                device=v.device,
+            )
+
+            logger.debug(
+                f"[NVFP4 Path] k_temp_paged.shape={k_temp_paged.shape}, v_temp_paged.shape={v_temp_paged.shape}"
+            )
+
+            # Build temporary page table
+            temp_page_table = torch.zeros(
+                batch_size, max(pages_per_req), dtype=torch.int32, device=k.device
+            )
+
+            # Fill temporary paged buffer and page table
+            page_offset = 0
+            for req_idx, (k_full, v_full, num_pages, seq_len) in enumerate(
+                zip(k_full_list, v_full_list, pages_per_req, full_lens)
+            ):
+                logger.debug(
+                    f"[NVFP4 Path] Filling req_idx={req_idx}, seq_len={seq_len}, num_pages={num_pages}, "
+                    f"page_offset={page_offset}"
+                )
+
+                # Fill page table for this request
+                temp_page_table[req_idx, :num_pages] = torch.arange(
+                    page_offset,
+                    page_offset + num_pages,
+                    dtype=torch.int32,
+                    device=k.device,
+                )
+
+                # Write KV data to paged buffer (with page_size padding)
+                for page_idx in range(num_pages):
+                    start_token = page_idx * self.page_size
+                    end_token = min(start_token + self.page_size, seq_len)
+                    token_count = end_token - start_token
+
+                    # k_full: [seq_len, num_heads, head_dim] -> [num_heads, seq_len, head_dim]
+                    k_page_data = k_full[start_token:end_token].permute(
+                        1, 0, 2
+                    )  # [num_heads, token_count, head_dim]
+                    v_page_data = v_full[start_token:end_token].permute(1, 0, 2)
+
+                    # Write to paged buffer (last page may have padding)
+                    k_temp_paged[page_offset + page_idx, :, :token_count, :] = (
+                        k_page_data
+                    )
+                    v_temp_paged[page_offset + page_idx, :, :token_count, :] = (
+                        v_page_data
+                    )
+
+                page_offset += num_pages
+
+            # Use temporary paged KV cache for attention
+            kv_cache = (k_temp_paged, v_temp_paged)
+
+            # Override metadata to use temporary page table
+            temp_metadata = TRTLLMMHAMetadata()
+            temp_metadata.cache_seqlens_int32 = forward_batch.seq_lens.to(torch.int32)
+            temp_metadata.max_seq_len_q = self.forward_metadata.max_seq_len_q
+            temp_metadata.max_seq_len_k = max(full_lens)
+            temp_metadata.cu_seqlens_q = self.forward_metadata.cu_seqlens_q
+            temp_metadata.cu_seqlens_k = torch.nn.functional.pad(
+                torch.cumsum(
+                    torch.tensor(full_lens, dtype=torch.int32, device=k.device), dim=0
+                ),
+                (1, 0),
+            )
+            temp_metadata.page_table = temp_page_table
+
+            logger.debug(
+                f"[NVFP4 Path] temp_metadata: max_seq_len_q={temp_metadata.max_seq_len_q}, "
+                f"max_seq_len_k={temp_metadata.max_seq_len_k}, "
+                f"page_table.shape={temp_metadata.page_table.shape}"
+            )
+
+            # Temporarily replace forward_metadata
+            original_metadata = self.forward_metadata
+            self.forward_metadata = temp_metadata
+
+            # else:
+            # target verify
+            # k_cache_nvfp4, k_scales = forward_batch.token_to_kv_pool._get_key_nvfp4_from_nvfp4_buffer()
+            # v_cache_nvfp4, v_scales = forward_batch.token_to_kv_pool._get_value_nvfp4_from_nvfp4_buffer()
+        elif use_fused_fp8_path:
             # Use fused FP8 quantization + KV cache write path
             self._fused_fp8_set_kv_buffer(
                 q=q,
@@ -673,24 +927,31 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
-        if self.data_type == torch.float8_e4m3fn:
-            q = q.to(torch.float8_e4m3fn)
+        if not nvfp4_kvcache_path:
+            # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
+            k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                layer.layer_id
+            )
+            k_cache = k_cache.view(
+                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+            ).permute(0, 2, 1, 3)
+            v_cache = v_cache.view(
+                -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+            ).permute(0, 2, 1, 3)
+            kv_cache = (k_cache, v_cache)
+
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-        # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
-        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        k_cache = k_cache.view(
-            -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
-        v_cache = v_cache.view(
-            -1, self.page_size, layer.tp_v_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
-        kv_cache = (k_cache, v_cache)
+        if self.data_type == torch.float8_e4m3fn or nvfp4_kvcache_path:
+            q = q.to(torch.float8_e4m3fn)
+
+        logger.debug(f"[forward_extend] q.shape={q.shape}, q.dtype={q.dtype}")
 
         # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sinks", None)
         # TODO: add support for quantization
         q_scale = 1.0
         k_scale = (
+            # where to load k global and v global scales?
             layer.k_scale_float
             if getattr(layer, "k_scale_float", None) is not None
             else 1.0
@@ -699,6 +960,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         bmm2_scale = 1.0
 
         if forward_batch.forward_mode.is_target_verify():
+            # logger.debug(f"[forward_extend] target_verify mode")
             o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
                 query=q,
                 kv_cache=kv_cache,
@@ -715,6 +977,123 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 q_len_per_req=self.forward_metadata.max_seq_len_q,
             )
         else:
+            # TODO: pass catted FP8 cache to trtllm mha kernel
+            logger.debug(
+                f"[forward_extend] prefill/extend mode, calling trtllm_batch_context_with_kv_cache"
+            )
+            logger.debug(
+                f"[forward_extend] metadata: max_seq_len_q={self.forward_metadata.max_seq_len_q}, "
+                f"max_seq_len_k={self.forward_metadata.max_seq_len_k}, "
+                f"batch_size={forward_batch.batch_size}"
+            )
+
+            # print(f"{q.shape=}, {q.dtype}")
+
+            # ============ Debug Info Before Kernel Call ============
+            logger.debug(
+                f"[KERNEL DEBUG] ====== trtllm_batch_context_with_kv_cache Parameters ======"
+            )
+            logger.debug(f"[KERNEL DEBUG] nvfp4_kvcache_path={nvfp4_kvcache_path}")
+
+            # Query info
+            logger.debug(f"[KERNEL DEBUG] query.shape={q.shape}, query.dtype={q.dtype}")
+            logger.debug(
+                f"[KERNEL DEBUG] query.device={q.device}, query.is_contiguous={q.is_contiguous()}"
+            )
+
+            # KV cache info
+            k_cache, v_cache = kv_cache
+            logger.debug(
+                f"[KERNEL DEBUG] k_cache.shape={k_cache.shape}, k_cache.dtype={k_cache.dtype}"
+            )
+            logger.debug(
+                f"[KERNEL DEBUG] v_cache.shape={v_cache.shape}, v_cache.dtype={v_cache.dtype}"
+            )
+            logger.debug(
+                f"[KERNEL DEBUG] k_cache.is_contiguous={k_cache.is_contiguous()}"
+            )
+            logger.debug(
+                f"[KERNEL DEBUG] v_cache.is_contiguous={v_cache.is_contiguous()}"
+            )
+            logger.debug(f"[KERNEL DEBUG] k_cache layout: strides={k_cache.stride()}")
+            logger.debug(f"[KERNEL DEBUG] v_cache layout: strides={v_cache.stride()}")
+
+            # Block tables and sequence lengths
+            logger.debug(
+                f"[KERNEL DEBUG] block_tables.shape={self.forward_metadata.page_table.shape}, "
+                f"dtype={self.forward_metadata.page_table.dtype}"
+            )
+            logger.debug(
+                f"[KERNEL DEBUG] block_tables sample (first 2 rows):\n{self.forward_metadata.page_table[:2]}"
+            )
+            logger.debug(
+                f"[KERNEL DEBUG] block_tables min={self.forward_metadata.page_table.min().item()}, "
+                f"max={self.forward_metadata.page_table.max().item()}"
+            )
+
+            logger.debug(
+                f"[KERNEL DEBUG] seq_lens={self.forward_metadata.cache_seqlens_int32.tolist()}"
+            )
+            logger.debug(
+                f"[KERNEL DEBUG] cum_seq_lens_q={self.forward_metadata.cu_seqlens_q.tolist()}"
+            )
+            logger.debug(
+                f"[KERNEL DEBUG] cum_seq_lens_kv={self.forward_metadata.cu_seqlens_k.tolist()}"
+            )
+
+            # Max lengths
+            logger.debug(
+                f"[KERNEL DEBUG] max_q_len={self.forward_metadata.max_seq_len_q}"
+            )
+            logger.debug(f"[KERNEL DEBUG] max_kv_len={self.max_context_len}")
+            logger.debug(f"[KERNEL DEBUG] batch_size={forward_batch.batch_size}")
+
+            # Scales
+            logger.debug(
+                f"[KERNEL DEBUG] bmm1_scale={bmm1_scale}, bmm2_scale={bmm2_scale}"
+            )
+            logger.debug(
+                f"[KERNEL DEBUG] q_scale={q_scale}, k_scale={k_scale}, layer.scaling={layer.scaling}"
+            )
+
+            # Window and other params
+            logger.debug(f"[KERNEL DEBUG] window_left={layer.sliding_window_size}")
+            logger.debug(f"[KERNEL DEBUG] attention_sink={attention_sink}")
+            logger.debug(f"[KERNEL DEBUG] out_dtype={self.q_data_type}")
+
+            # Workspace buffer
+            logger.debug(
+                f"[KERNEL DEBUG] workspace_buffer.shape={self.workspace_buffer.shape}, "
+                f"dtype={self.workspace_buffer.dtype}"
+            )
+            logger.debug(
+                f"[KERNEL DEBUG] workspace_buffer size={self.workspace_buffer.numel() * self.workspace_buffer.element_size() / (1024**2):.2f} MB"
+            )
+
+            # Page size info
+            logger.debug(f"[KERNEL DEBUG] page_size={self.page_size}")
+
+            # Sanity checks
+            expected_total_q_tokens = self.forward_metadata.cu_seqlens_q[-1].item()
+            expected_total_kv_tokens = self.forward_metadata.cu_seqlens_k[-1].item()
+            logger.debug(
+                f"[KERNEL DEBUG] Sanity check: q.shape[0]={q.shape[0]} vs expected_total_q_tokens={expected_total_q_tokens}"
+            )
+            logger.debug(
+                f"[KERNEL DEBUG] Sanity check: expected_total_kv_tokens={expected_total_kv_tokens}"
+            )
+
+            # Check if dimensions match expectations
+            if nvfp4_kvcache_path:
+                logger.debug(f"[KERNEL DEBUG] NVFP4 Path: using temporary paged buffer")
+                logger.debug(
+                    f"[KERNEL DEBUG] NVFP4 Path: num_pages={k_cache.shape[0]}, "
+                    f"page_size={k_cache.shape[2]}, num_heads={k_cache.shape[1]}, head_dim={k_cache.shape[3]}"
+                )
+            else:
+                logger.debug(f"[KERNEL DEBUG] Standard Path: using original KV buffer")
+
+            logger.debug(f"[KERNEL DEBUG] ====== End of Parameter Dump ======")
 
             o = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
                 query=q,
@@ -734,6 +1113,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 sinks=attention_sink,
                 out_dtype=self.q_data_type,  # model_runner.dtype
             )
+
+        if nvfp4_kvcache_path:
+            self.forward_metadata = original_metadata
+            logger.debug(f"[NVFP4 Path] Restored original metadata")
+
+        logger.debug(f"[forward_extend] o.shape={o.shape}, returning reshaped output")
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
