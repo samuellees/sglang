@@ -162,6 +162,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
         self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
 
+        self.is_sm100_gpu = is_sm100_supported()
+        self.is_nvfp4_kvcache = self.data_type == torch.float4_e2m1fn_x2
+
+        # k/v scales on GPU tensor, used for NVFP4 KV Cache
+        self.k_scales_gpu, self.v_scales_gpu = self.preload_kv_scales(
+            config, model_runner
+        )
+
     def preload_kv_scales(self, config, model_runner: ModelRunner):
         if not self.is_nvfp4_kvcache:
             return None, None
@@ -995,7 +1003,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             sinks=attention_sink,
             out_dtype=q.dtype,  # model_runner.dtype
             # out_dtype=self.q_data_type,  # model_runner.dtype
-            kv_block_scales=kv_cache_block_scales,
+            # kv_block_scales=kv_cache_block_scales,
         )
         o = o.to(self.q_data_type)
         # import sys
