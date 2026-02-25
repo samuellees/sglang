@@ -146,15 +146,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # Forward metadata
         self.forward_metadata: Optional[TRTLLMMHAMetadata] = None
-        
-        self.is_sm100_gpu = is_sm100_supported(model_runner.device)
+
+        self.is_sm100_gpu = is_sm100_supported()
         self.is_nvfp4_kvcache = self.data_type == torch.float4_e2m1fn_x2
 
         # k/v scales on GPU tensor, used for NVFP4 KV Cache
         self.k_scales_gpu, self.v_scales_gpu = self.preload_kv_scales(
             config, model_runner
         )
-
 
         # Init backend (XQA or TRTLLM-GEN)
         # We need to specify q_type and out_type for different backend
@@ -757,7 +756,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             else:
                 metadata.max_seq_len_q = metadata.max_seq_len_k
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
-
 
             # construct nvfp4 kv cache dequant page table for extend stage
             if self.data_type == torch.float4_e2m1fn_x2:
