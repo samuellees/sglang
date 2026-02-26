@@ -189,11 +189,16 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
     if cfg := runner.mambaish_config:
         from sglang.srt.layers.attention.fla.utils import check_environments
         from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
-            GDNAttnBackend,
             HybridLinearAttnBackend,
-            KimiLinearAttnBackend,
-            LightningAttentionBackend,
             Mamba2AttnBackend,
+        )
+        from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+        from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+        from sglang.srt.layers.attention.linear.lightning_backend import (
+            LightningAttentionBackend,
+        )
+        from sglang.srt.layers.attention.linear.utils import (
+            initialize_linear_attn_config,
         )
         from sglang.srt.utils import (
             is_blackwell,
@@ -202,28 +207,30 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             is_sm120_supported,
         )
 
-        check_environments()
-        if runner.hybrid_gdn_config is not None:
+        if is_blackwell():
             if is_sm100_supported():
                 arch_name = "SM100"
                 allowed_backends = ["triton", "trtllm_mha"]
             elif is_sm120_supported():
                 arch_name = "SM120"
                 allowed_backends = ["triton", "trtllm_mha", "flashinfer"]
-            if is_blackwell():
-                assert (
-                    runner.server_args.attention_backend in allowed_backends
-                ), f"{', '.join(allowed_backends)} backend are the only supported backends on {arch_name} GPUs for hybrid GDN models, use --attention-backend to specify the backend."
-            if is_npu():
-                assert (
-                    runner.server_args.attention_backend == "ascend"
-                ), "ascend backend is the only supported backend on NPU for hybrid GDN models, use --attention-backend ascend to specify the backend."
+            assert (
+                runner.server_args.attention_backend in allowed_backends
+            ), f"{', '.join(allowed_backends)} backend are the only supported backends on {arch_name} GPUs for hybrid GDN models, use --attention-backend to specify the backend."
+        elif is_npu():
+            assert (
+                runner.server_args.attention_backend == "ascend"
+            ), "ascend backend is the only supported backend on NPU for hybrid GDN models, use --attention-backend ascend to specify the backend."
+
+        check_environments()
+        initialize_linear_attn_config(runner.server_args)
+        if runner.hybrid_gdn_config is not None:
             logger.info(f"Using hybrid linear attention backend for hybrid GDN models.")
             linear_attn_backend = GDNAttnBackend(runner)
         elif runner.mamba2_config is not None:
             linear_attn_backend = Mamba2AttnBackend(runner)
         elif runner.kimi_linear_config is not None:
-            linear_attn_backend = KimiLinearAttnBackend(runner)
+            linear_attn_backend = KDAAttnBackend(runner)
         elif runner.hybrid_lightning_config is not None:
             linear_attn_backend = LightningAttentionBackend(runner)
         else:
