@@ -195,15 +195,25 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             LightningAttentionBackend,
             Mamba2AttnBackend,
         )
-        from sglang.srt.utils import is_blackwell, is_npu
+        from sglang.srt.utils import (
+            is_blackwell,
+            is_npu,
+            is_sm100_supported,
+            is_sm120_supported,
+        )
 
         check_environments()
         if runner.hybrid_gdn_config is not None:
+            if is_sm100_supported():
+                arch_name = "SM100"
+                allowed_backends = ["triton", "trtllm_mha"]
+            elif is_sm120_supported():
+                arch_name = "SM120"
+                allowed_backends = ["triton", "trtllm_mha", "flashinfer"]
             if is_blackwell():
                 assert (
-                    runner.server_args.attention_backend == "triton"
-                    or runner.server_args.attention_backend == "trtllm_mha"
-                ), "triton or trtllm_mha backend are the only supported backends on Blackwell GPUs for hybrid GDN models, use --attention-backend triton or --attention-backend trtllm_mha to specify the backend."
+                    runner.server_args.attention_backend in allowed_backends
+                ), f"{', '.join(allowed_backends)} backend are the only supported backends on {arch_name} GPUs for hybrid GDN models, use --attention-backend to specify the backend."
             if is_npu():
                 assert (
                     runner.server_args.attention_backend == "ascend"
