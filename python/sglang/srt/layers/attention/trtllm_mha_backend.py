@@ -165,15 +165,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
         self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
 
-        self.is_sm100_gpu = is_sm100_supported()
-        self.is_nvfp4_kvcache = self.data_type == torch.float4_e2m1fn_x2
-
-        # k/v scales on GPU tensor, used for NVFP4 KV Cache
-        self.k_scales_gpu, self.v_scales_gpu = self.preload_kv_scales(
-            config, model_runner
-        )
-
-    def preload_kv_scales(self, config, model_runner: ModelRunner):
+    def preload_kv_scales(self, config, model_runner: "ModelRunner"):
         if not self.is_nvfp4_kvcache:
             return None, None
         num_layers = config.num_hidden_layers
@@ -196,13 +188,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 if hasattr(layer.attention, "attn"):
                     attention_layers.append(layer.attention.attn)
 
-        # logger.info(f"Preloading k/v scales for {len(attention_layers)} layers to GPU")
         for layer in attention_layers:
             layer_id = layer.layer_id
             if layer_id >= len(v_scales_cpu):
                 continue
 
-            # prepare k/v global scale
             if not hasattr(layer, "k_scale") or layer.k_scale is None:
                 k_scale = 1.0
             else:
@@ -219,7 +209,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             k_scales_cpu[layer_id] = k_scale
             v_scales_cpu[layer_id] = v_scale
 
-        # 一次性拷贝到 GPU
         k_scales_gpu = torch.ones(
             num_layers, dtype=torch.float32, device=model_runner.device
         )
@@ -228,11 +217,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         )
         k_scales_gpu.copy_(k_scales_cpu, non_blocking=True)
         v_scales_gpu.copy_(v_scales_cpu, non_blocking=True)
-        # logger.info(f"{k_scales_gpu=}, {v_scales_gpu=}")
-        # import sys
-        # sys.stdout.flush()
         return k_scales_gpu, v_scales_gpu
-
     def _maybe_translate_swa(
         self, token_indices: torch.Tensor
     ) -> Optional[torch.Tensor]:
@@ -881,7 +866,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     layer, cache_loc, k, v, k_scale, v_scale
                 )
 
-        # prepare query
         # For XQA, q_dtype should be bf16
         if (self.data_type == torch.float8_e4m3fn or self.is_nvfp4_kvcache) and (
             not self.is_xqa_impl
