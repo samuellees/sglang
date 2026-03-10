@@ -815,7 +815,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         self.forward_metadata = metadata
 
-        self._prepare_nvfp4_metadata_for_extend(forward_batch)
+        # self._prepare_nvfp4_metadata_for_extend(forward_batch)
 
     def forward_decode(
         self,

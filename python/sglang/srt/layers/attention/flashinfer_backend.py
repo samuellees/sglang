@@ -501,6 +501,7 @@ class FlashInferAttnBackend(AttentionBackend):
         """This must be called after init_forward_metadata/capture_cuda_graph/replay_cuda_graph"""
         # construct nvfp4 kv cache dequant page table for extend stage
         self.dq_page_table = None
+        self.dq_paged_kernel_lens = None
         self.cpu_req_pool_indices = None
         if (
             self.is_nvfp4_kvcache
@@ -520,6 +521,13 @@ class FlashInferAttnBackend(AttentionBackend):
                     (paged_seq_lens_cpu + self.page_size - 1)
                     // self.page_size
                     * self.page_size
+                )
+                # Store page-aligned per-request lengths (excluding buffer)
+                # for kv_indptr alignment in call_begin_forward
+                self.dq_paged_kernel_lens = torch.tensor(
+                    paged_seq_lens_cpu_padded[:-1].tolist(),
+                    dtype=torch.int32,
+                    device=forward_batch.req_pool_indices.device,
                 )
                 total_paged_tokens = sum(paged_seq_lens_cpu_padded)
                 self.dq_page_table = torch.arange(
@@ -1644,7 +1652,20 @@ class FlashInferIndicesUpdaterPrefill:
         if spec_info is None:
             assert len(seq_lens) == len(req_pool_indices)
             # Normal extend
-            kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
+            # When using custom_kv_indices (NVFP4 dq_page_table), the dq buffer
+            # layout is page-aligned per request. Use page-aligned lengths for
+            # kv_indptr so that each request's region in dq_page_table matches
+            # the actual dq buffer layout. Causal masking ensures padding tokens
+            # at the end of each request's region are never attended to.
+            if (
+                custom_kv_indices is not None
+                and self.attn_backend.dq_paged_kernel_lens is not None
+            ):
+                kv_indptr[1 : bs + 1] = torch.cumsum(
+                    self.attn_backend.dq_paged_kernel_lens, dim=0
+                )
+            else:
+                kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
 
             if custom_kv_indices is not None:
