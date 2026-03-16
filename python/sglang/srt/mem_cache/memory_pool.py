@@ -57,10 +57,10 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
+    is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
     next_power_of_2,
-    is_float4_e2m1fn_x2,
 )
 from sglang.srt.utils.common import is_sm100_supported, is_sm120_supported
 from sglang.srt.utils.custom_op import register_custom_op
@@ -1509,11 +1509,15 @@ class HybridLinearKVPool(KVCache):
 
     def get_key_buffer(self, layer_id: int, scale: Optional[float] = None):
         layer_id = self._transfer_full_attention_id(layer_id)
-        return self.full_kv_pool.get_key_buffer(layer_id, scale)
+        if scale is not None:
+            return self.full_kv_pool.get_key_buffer(layer_id, scale)
+        return self.full_kv_pool.get_key_buffer(layer_id)
 
     def get_value_buffer(self, layer_id: int, scale: Optional[float] = None):
         layer_id = self._transfer_full_attention_id(layer_id)
-        return self.full_kv_pool.get_value_buffer(layer_id, scale)
+        if scale is not None:
+            return self.full_kv_pool.get_value_buffer(layer_id, scale)
+        return self.full_kv_pool.get_value_buffer(layer_id)
 
     def get_kv_buffer(
         self,

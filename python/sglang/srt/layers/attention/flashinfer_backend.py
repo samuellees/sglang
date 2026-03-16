@@ -192,6 +192,10 @@ class FlashInferAttnBackend(AttentionBackend):
         self.is_dllm_model = self.dllm_config is not None
 
         self.is_nvfp4_kvcache = model_runner.kv_cache_dtype == torch.float4_e2m1fn_x2
+        self.dq_page_table = None
+        self.dq_paged_kernel_lens = None
+        self.cpu_req_pool_indices = None
+        self.transfer_cur_chunk_kv = False
         # For nvfp4 kv cache, we don't use flashinfer-decode, and we use fp8 kv cache for prefill, so set kv_cache_dtype_alias
         # to pass the checks
         self.kv_cache_dtype_alias = (
@@ -512,6 +516,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 paged_seq_lens_cpu = forward_batch.extend_prefix_lens_cpu
             else:
                 paged_seq_lens_cpu = forward_batch.seq_lens_cpu
+            if not isinstance(paged_seq_lens_cpu, list):
+                paged_seq_lens_cpu = paged_seq_lens_cpu.tolist()
             if sum(paged_seq_lens_cpu) > 0:
                 # [prefix_len, 256] -> [padded_prefix_len, 256] -> sum_tokens -> token_indices[page_size, ..., padde_prefix_len + 256 + page_size]
                 paged_seq_lens_cpu.append(256)
@@ -745,6 +751,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
+            self.transfer_cur_chunk_kv = not self.forward_metadata.use_ragged
         elif forward_mode.is_draft_extend():
             prefill_wrappers = []
             for i in range(self.num_wrappers):
@@ -775,6 +782,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
+            self.transfer_cur_chunk_kv = not self.forward_metadata.use_ragged
         elif forward_mode.is_dllm_extend():
             prefill_wrappers = []
             for i in range(self.num_wrappers):
@@ -1002,9 +1010,10 @@ class FlashInferAttnBackend(AttentionBackend):
 
         # We perform dequant for chunk prefill/cache reuse.
         if self.is_nvfp4_kvcache:
-            self._dequant_nvfp4_kv_for_extend_base(
-                k, v, layer, forward_batch, self.transfer_cur_chunk_kv
-            )
+            if self.dq_page_table is not None:
+                self._dequant_nvfp4_kv_for_extend_base(
+                    k, v, layer, forward_batch, self.transfer_cur_chunk_kv
+                )
             k_buffer_dq, v_buffer_dq = forward_batch.token_to_kv_pool.get_dq_kv_buffer()
             k_paged = k_buffer_dq.view(-1, layer.tp_k_head_num, layer.head_dim)
             v_paged = v_buffer_dq.view(-1, layer.tp_v_head_num, layer.head_dim)

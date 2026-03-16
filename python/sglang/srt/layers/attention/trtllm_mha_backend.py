@@ -218,6 +218,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         k_scales_gpu.copy_(k_scales_cpu, non_blocking=True)
         v_scales_gpu.copy_(v_scales_cpu, non_blocking=True)
         return k_scales_gpu, v_scales_gpu
+
     def _maybe_translate_swa(
         self, token_indices: torch.Tensor
     ) -> Optional[torch.Tensor]:
@@ -1169,9 +1170,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend(include_v2=True)
         ):
-            assert (
-                False
-            ), "NVFP4 kv cache is not supported for MTP draft extend for now."
             k_cache, k_cache_scales = forward_batch.token_to_kv_pool.get_fp4_key_buffer(
                 layer.layer_id
             )
@@ -1223,31 +1221,43 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             cur_step_page_table = self._get_layer_page_table(layer, forward_batch)
 
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-        if self.data_type == torch.float8_e4m3fn or self.is_nvfp4_kvcache:
-            q = q.to(torch.float8_e4m3fn)
 
         # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sinks", None)
-        # TODO: add support for quantization
         q_scale = 1.0
-        # k_scale = (
-        #     # where to load k global and v global scales?
-        #     layer.k_scale_float
-        #     if getattr(layer, "k_scale_float", None) is not None
-        #     else 1.0
-        # )
         bmm1_scale = q_scale * k_scale * layer.scaling
         bmm2_scale = v_scale
 
-        # page_table = self._get_layer_page_table(layer, forward_batch)
+        if forward_batch.forward_mode.is_target_verify() or (
+            forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            and self.is_xqa_impl
+        ):
+            # Use XQA decode kernel for target_verify and draft_extend on XQA-capable GPUs
+            # XQA only supports fp16/bf16 query input
+            if (
+                self.data_type == torch.float8_e4m3fn or self.is_nvfp4_kvcache
+            ) and self.is_xqa_impl:
+                q = q.to(torch.float16)
 
-        if forward_batch.forward_mode.is_target_verify():
-            # Paths:
-            #   4. bf16/fp8/nvfp4, target model verify, w/ cudagraph, is_target_verify(), decode mha kernel
+            # Build causal mask for speculative decoding (q_seq_len > 1)
+            q_seq_len = self.forward_metadata.max_seq_len_q
+            spec_mask = None
+            if q_seq_len > 1:
+                mask_size_per_row = ((q_seq_len + 31) // 32) * 2
+                spec_mask = torch.zeros(
+                    (forward_batch.batch_size, q_seq_len, mask_size_per_row),
+                    dtype=torch.uint16,
+                    device=q.device,
+                )
+                for i in range(q_seq_len):
+                    # Each row i: bits 0..i are set (causal: token i sees tokens 0..i)
+                    val = (1 << (i + 1)) - 1
+                    spec_mask[:, i, 0] = val
+
             o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
                 query=q,
                 kv_cache=kv_cache,
-                kv_block_scales=kv_block_scales,
+                kv_cache_sf=kv_block_scales,
                 workspace_buffer=self.workspace_buffer,
                 block_tables=cur_step_page_table,
                 seq_lens=self.forward_metadata.cache_seqlens_int32,
@@ -1257,18 +1267,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 window_left=layer.sliding_window_size,
                 sinks=attention_sink,
                 out_dtype=q.dtype,  # fp4 kv kernel doesn't support bf16 output
-                q_len_per_req=self.forward_metadata.max_seq_len_q,
+                q_len_per_req=q_seq_len,
+                mask=spec_mask,
             )
         else:
-            # # TODO: pass catted FP8 cache to trtllm mha kernel
-            # logger.debug(
-            #     f"[forward_extend] prefill/extend mode, calling trtllm_batch_context_with_kv_cache"
-            # )
-            # logger.debug(
-            #     f"[forward_extend] metadata: max_seq_len_q={self.forward_metadata.max_seq_len_q}, "
-            #     f"max_seq_len_k={self.forward_metadata.max_seq_len_k}, "
-            #     f"batch_size={forward_batch.batch_size}"
-            # )
+            # Context kernel path for normal prefill/extend
+            if self.data_type == torch.float8_e4m3fn or self.is_nvfp4_kvcache:
+                q = q.to(torch.float8_e4m3fn)
 
             # # print(f"{q.shape=}, {q.dtype}")
 
