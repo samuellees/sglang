@@ -55,38 +55,53 @@ python3 -m sglang.launch_server \
     --model-path <model_path> \
     --tp-size <num_gpus> \
     --kv-cache-dtype fp4_e2m1 \
-    --attention-backend flashinfer \
+    --prefill-attention-backend flashinfer \
     --decode-attention-backend trtllm_mha \
+    --moe-runner-backend triton \
+    --mamba-ssm-dtype bfloat16 \
+    --disable-radix-cache \
+    --cuda-graph-bs 1 2 4 8 16 32 64 128 256 512 \
+    --mem-fraction-static 0.6 \
     --host 0.0.0.0 --port 30000
 ```
 
 Key arguments:
 - `--kv-cache-dtype fp4_e2m1`: Enable NVFP4 KV cache
-- `--attention-backend flashinfer`: Use FlashInfer for prefill (dequantizes FP4→FP8 for prefill kernel)
+- `--prefill-attention-backend flashinfer`: Use FlashInfer for prefill (dequantizes FP4→FP8 for prefill kernel)
 - `--decode-attention-backend trtllm_mha`: Use TRT-LLM XQA decode kernel (native FP4 support)
+- `--moe-runner-backend triton`: Use Triton MoE runner
+- `--mamba-ssm-dtype bfloat16`: Use BF16 for Mamba SSM (for hybrid models like Qwen3.5)
 
 ### With MTP (Multi-Token Prediction)
 
 ```bash
 python3 -m sglang.launch_server \
     --model-path <model_path> \
-    --tp-size <num_gpus> \
+    --tp-size <num_gpus> --ep-size 1 \
     --kv-cache-dtype fp4_e2m1 \
-    --attention-backend flashinfer \
+    --prefill-attention-backend flashinfer \
     --decode-attention-backend trtllm_mha \
     --moe-runner-backend triton \
-    --speculative-algorithm EAGLE \
-    --speculative-draft-model-path <model_path> \
-    --speculative-num-draft-tokens 3 \
+    --mamba-ssm-dtype bfloat16 \
+    --speculative-algorithm NEXTN \
+    --speculative-num-steps 2 \
     --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 3 \
     --speculative-attention-mode decode \
-    --mem-fraction-static 0.65 \
+    --disable-radix-cache \
+    --cuda-graph-bs 1 2 4 8 16 32 64 128 256 512 \
+    --chunked-prefill-size 512 \
+    --max-prefill-tokens 512 \
+    --max-running-requests 256 \
+    --mem-fraction-static 0.6 \
+    --random-seed 0 \
     --host 0.0.0.0 --port 30000
 ```
 
 Additional MTP arguments:
+- `--speculative-algorithm NEXTN`: Use NEXTN speculative decoding algorithm
 - `--speculative-attention-mode decode`: Forces draft_extend/target_verify to use the XQA decode kernel (required because the context kernel does not support NVFP4 scales)
-- `--mem-fraction-static 0.65`: MTP requires more GPU memory; reduce from default 0.85
+- `--mem-fraction-static 0.6`: MTP requires more GPU memory; reduce from default 0.85
 
 ## Testing
 
@@ -95,16 +110,13 @@ Additional MTP arguments:
 Start the server with NVFP4 KV cache, then run:
 
 ```bash
-# Quick check (100 questions, ~2 min, may have ±3% variance)
-python3 -m sglang.test.run_eval --eval-name gsm8k --port 30000 \
-  --model <model_path> --num-examples 100 --num-threads 16
-
 # Full evaluation (1319 questions, recommended for accurate results)
-python3 -m sglang.test.run_eval --eval-name gsm8k --port 30000 \
-  --model <model_path> --num-examples 1319 --num-threads 16
+python3 benchmark/gsm8k/bench_sglang.py \
+    --num-questions 1319 \
+    --parallel 1319 \
+    --port 30000 \
+    --max-new-tokens 10240
 ```
-
-> **Note**: 100 questions is suitable for quick sanity checks but may show ±3% variance between runs. For reliable accuracy numbers, run the full 1319-question set.
 
 Recommended model: [Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen3.5-35B-A3B)
 
