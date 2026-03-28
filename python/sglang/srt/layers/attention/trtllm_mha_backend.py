@@ -150,11 +150,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.is_sm100_gpu = is_sm100_supported()
         self.is_nvfp4_kvcache = self.data_type == torch.float4_e2m1fn_x2
 
-        # k/v scales on GPU tensor, used for NVFP4 KV Cache
-        self.k_scales_gpu, self.v_scales_gpu = self.preload_kv_scales(
-            config, model_runner
-        )
-
         # Init backend (XQA or TRTLLM-GEN)
         # We need to specify q_type and out_type for different backend
         # XQA: (q_type must be bf16)
@@ -164,60 +159,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         #   KV bf16: q_type = bf16, out_type=model_runner.dtype
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
         self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
-
-    def preload_kv_scales(self, config, model_runner: "ModelRunner"):
-        if not self.is_nvfp4_kvcache:
-            return None, None
-        num_layers = config.num_hidden_layers
-        k_scales_cpu = torch.ones(num_layers, dtype=torch.float32, device="cpu")
-        v_scales_cpu = torch.ones(num_layers, dtype=torch.float32, device="cpu")
-
-        from sglang.srt.model_executor.model_runner import resolve_language_model
-
-        attention_layers = []
-        language_model = resolve_language_model(model_runner.model)
-        for layer in language_model.layers:
-            if hasattr(layer, "self_attn"):
-                if hasattr(layer.self_attn, "attn"):
-                    attention_layers.append(layer.self_attn.attn)
-                elif hasattr(layer.self_attn, "attn_mqa"):
-                    attention_layers.append(layer.self_attn.attn_mqa)
-            elif hasattr(layer, "attn"):
-                attention_layers.append(layer.attn)
-            elif hasattr(layer, "attention"):
-                if hasattr(layer.attention, "attn"):
-                    attention_layers.append(layer.attention.attn)
-
-        for layer in attention_layers:
-            layer_id = layer.layer_id
-            if layer_id >= len(v_scales_cpu):
-                continue
-
-            if not hasattr(layer, "k_scale") or layer.k_scale is None:
-                k_scale = 1.0
-            else:
-                k_scale = layer.k_scale
-            if not hasattr(layer, "v_scale") or layer.v_scale is None:
-                v_scale = 1.0
-            else:
-                v_scale = layer.v_scale
-
-            if self.is_sm100_gpu:
-                k_scale = k_scale * 6.0
-                v_scale = v_scale * 6.0
-
-            k_scales_cpu[layer_id] = k_scale
-            v_scales_cpu[layer_id] = v_scale
-
-        k_scales_gpu = torch.ones(
-            num_layers, dtype=torch.float32, device=model_runner.device
-        )
-        v_scales_gpu = torch.ones(
-            num_layers, dtype=torch.float32, device=model_runner.device
-        )
-        k_scales_gpu.copy_(k_scales_cpu, non_blocking=True)
-        v_scales_gpu.copy_(v_scales_cpu, non_blocking=True)
-        return k_scales_gpu, v_scales_gpu
 
     def _maybe_translate_swa(
         self, token_indices: torch.Tensor
@@ -821,24 +762,30 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
 
-        # prepare k/v global scale
-        if not hasattr(layer, "k_scale") or layer.k_scale is None:
-            k_scale = 1.0
-        else:
-            k_scale = layer.k_scale
-        if not hasattr(layer, "v_scale") or layer.v_scale is None:
-            v_scale = 1.0
-        else:
-            v_scale = layer.v_scale
+        # k/v scale for attention BMM (FP8 path needs a float; default 1.0)
+        k_scale = (
+            layer.k_scale
+            if (hasattr(layer, "k_scale") and layer.k_scale is not None)
+            else 1.0
+        )
+        v_scale = (
+            layer.v_scale
+            if (hasattr(layer, "v_scale") and layer.v_scale is not None)
+            else 1.0
+        )
+        # k/v scale for set_kv_buffer: pass None so pool auto-resolves NVFP4 per-layer scales
+        kv_store_k_scale = (
+            layer.k_scale
+            if (hasattr(layer, "k_scale") and layer.k_scale is not None)
+            else None
+        )
+        kv_store_v_scale = (
+            layer.v_scale
+            if (hasattr(layer, "v_scale") and layer.v_scale is not None)
+            else None
+        )
 
-        if self.is_nvfp4_kvcache:
-            if self.is_sm100_gpu:
-                # re-scale for requirements of trtllm nvfp4 kv cache kernel
-                # we only apply this rescale for quant kernel, but not fp8 mha kernel
-                k_scale = k_scale * 6.0
-                v_scale = v_scale * 6.0
-            cur_k_scale_gpu = self.k_scales_gpu[layer.layer_id : layer.layer_id + 1]
-            cur_v_scale_gpu = self.v_scales_gpu[layer.layer_id : layer.layer_id + 1]
+        pool = forward_batch.token_to_kv_pool
 
         # save k/v cache to kv pool
         if save_kv_cache and k is not None:
@@ -853,18 +800,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 )
                 k = None
                 v = None
-            elif self.is_nvfp4_kvcache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer,
-                    cache_loc,
-                    k,
-                    v,
-                    cur_k_scale_gpu,
-                    cur_v_scale_gpu,
-                )
             else:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, k_scale, v_scale
+                # For NVFP4, pool auto-resolves global scales from quant_method.
+                pool.set_kv_buffer(
+                    layer, cache_loc, k, v, kv_store_k_scale, kv_store_v_scale
                 )
 
         # For XQA, q_dtype should be bf16
@@ -876,13 +815,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # prepare kv cache
         if self.is_nvfp4_kvcache:
-
-            k_cache, k_cache_scales = forward_batch.token_to_kv_pool.get_fp4_key_buffer(
-                layer.layer_id
-            )
-            v_cache, v_cache_scales = (
-                forward_batch.token_to_kv_pool.get_fp4_value_buffer(layer.layer_id)
-            )
+            raw = pool.get_raw_kv_buffer(layer.layer_id)
+            k_cache, k_cache_scales = raw["k"], raw["k_scale"]
+            v_cache, v_cache_scales = raw["v"], raw["v_scale"]
             k_cache = k_cache.view(
                 -1, self.page_size, layer.tp_k_head_num, layer.head_dim // 2
             ).permute(0, 2, 1, 3)
@@ -903,19 +838,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             if layer.tp_v_head_num == 1:
                 v_cache = canonicalize_stride(v_cache)
                 v_cache_scales = canonicalize_stride(v_cache_scales)
-            # wrap for trtllm-gen mha
-            # k_scale = k_scale * 6.0
-            # v_scale = v_scale * 6.0
-            # k_cache_scales = (k_cache_scales.float() / 6.0).to(torch.float8_e4m3fn)
-            # v_cache_scales = (v_cache_scales.float() / 6.0).to(torch.float8_e4m3fn)
 
             kv_cache = (k_cache, v_cache)
             kv_cache_block_scales = (k_cache_scales, v_cache_scales)
 
         else:
-            k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
-                layer.layer_id
-            )
+            k_cache, v_cache = pool.get_kv_buffer(layer.layer_id)
             # shape conversion:
             # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
             k_cache = k_cache.view(
@@ -1006,17 +934,29 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
 
-        # process k/v global scale
-        v_scale = layer.v_scale
-        k_scale = layer.k_scale
-        if not hasattr(layer, "k_scale") or layer.k_scale is None:
-            k_scale = 1.0
-        if not hasattr(layer, "v_scale") or layer.v_scale is None:
-            v_scale = 1.0
+        # process k/v global scale (for FP8 attention BMM; NVFP4 scales are in pool.quant_method)
+        k_scale = (
+            layer.k_scale
+            if (hasattr(layer, "k_scale") and layer.k_scale is not None)
+            else 1.0
+        )
+        v_scale = (
+            layer.v_scale
+            if (hasattr(layer, "v_scale") and layer.v_scale is not None)
+            else 1.0
+        )
+        kv_store_k_scale = (
+            layer.k_scale
+            if (hasattr(layer, "k_scale") and layer.k_scale is not None)
+            else None
+        )
+        kv_store_v_scale = (
+            layer.v_scale
+            if (hasattr(layer, "v_scale") and layer.v_scale is not None)
+            else None
+        )
 
-        if self.is_nvfp4_kvcache:
-            cur_k_scale_gpu = self.k_scales_gpu[layer.layer_id : layer.layer_id + 1]
-            cur_v_scale_gpu = self.v_scales_gpu[layer.layer_id : layer.layer_id + 1]
+        pool = forward_batch.token_to_kv_pool
 
         # save k/v cache to kv pool
         if save_kv_cache and k is not None:
@@ -1031,18 +971,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 )
                 k = None
                 v = None
-            elif self.is_nvfp4_kvcache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer=layer,
-                    loc=cache_loc,
-                    cache_k=k,
-                    cache_v=v,
-                    k_scale=cur_k_scale_gpu,
-                    v_scale=cur_v_scale_gpu,
-                )
             else:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, k_scale, v_scale
+                # For NVFP4, pool auto-resolves global scales from quant_method.
+                pool.set_kv_buffer(
+                    layer, cache_loc, k, v, kv_store_k_scale, kv_store_v_scale
                 )
 
         if (
@@ -1052,97 +984,21 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             # path:
             #   1. nvfp4, target model prefill/chunkedprefill, w/o cudagraph, is_extend_without_speculative(), context mha kernel
             #   2. nvfp4, draft model prefill/chunkedprefill, w/o cudagraph, is_extend_without_speculative(), context mha kernel
-            from sglang.srt.layers.quantization.fp4_utils import NVFP4QuantizeUtil
 
-            batch_size = forward_batch.batch_size
+            # Convert current k/v to fp8 for writing into dequant workspace
+            k_cur_fp8 = k.to(torch.float8_e4m3fn) if k is not None else None
+            v_cur_fp8 = v.to(torch.float8_e4m3fn) if v is not None else None
 
-            k_buffer_nvfp4, k_scales_buffer = (
-                forward_batch.token_to_kv_pool.get_fp4_key_buffer(layer.layer_id)
+            k_buffer_dq, v_buffer_dq = pool.dequant_kv_for_extend(
+                layer.layer_id,
+                forward_batch.req_to_token_pool.req_to_token,
+                self.cpu_req_pool_indices,
+                forward_batch.extend_prefix_lens_cpu,
+                forward_batch.extend_seq_lens_cpu,
+                self.page_size,
+                k_cur_fp8=k_cur_fp8,
+                v_cur_fp8=v_cur_fp8,
             )
-            v_buffer_nvfp4, v_scales_buffer = (
-                forward_batch.token_to_kv_pool.get_fp4_value_buffer(layer.layer_id)
-            )
-            k_buffer_dq, v_buffer_dq = forward_batch.token_to_kv_pool.get_dq_kv_buffer()
-
-            # Convert current k/v to fp8 once
-            k_cur_fp8 = k.to(torch.float8_e4m3fn)
-            v_cur_fp8 = v.to(torch.float8_e4m3fn)
-
-            # Process each request in batch
-            cur_batch_start_loc_cpu = 0
-            # skip first page for dummy output
-            cur_token_idx_dq_buffer_cpu = self.page_size
-            for batch_idx in range(batch_size):
-                req_pool_idx = self.cpu_req_pool_indices[batch_idx]
-                prev_len = forward_batch.extend_prefix_lens_cpu[batch_idx]
-                extend_len = forward_batch.extend_seq_lens_cpu[batch_idx]
-                # prev_len = self.prefix_lengths_kv_cpu[batch_idx]
-                # extend_len = self.extend_lengths_kv_cpu[batch_idx]
-
-                # Dequantize and copy previous KV
-                if prev_len > 0:
-                    prev_token_indices = forward_batch.req_to_token_pool.req_to_token[
-                        req_pool_idx, :prev_len
-                    ]
-                    k_prev_nvfp4 = k_buffer_nvfp4[prev_token_indices]
-                    k_prev_scales = k_scales_buffer[prev_token_indices]
-                    v_prev_nvfp4 = v_buffer_nvfp4[prev_token_indices]
-                    v_prev_scales = v_scales_buffer[prev_token_indices]
-
-                    # Dequantize: [prev_len, num_heads, head_dim]
-                    k_prev_bf16 = NVFP4QuantizeUtil.cuda_nvfp4_dequantize(
-                        k_prev_nvfp4.view(torch.uint8),
-                        k_prev_scales,
-                        cur_k_scale_gpu,
-                    )
-                    v_prev_bf16 = NVFP4QuantizeUtil.cuda_nvfp4_dequantize(
-                        v_prev_nvfp4.view(torch.uint8),
-                        v_prev_scales,
-                        cur_v_scale_gpu,
-                    )
-                    k_prev_fp8 = k_prev_bf16.to(torch.float8_e4m3fn)
-                    v_prev_fp8 = v_prev_bf16.to(torch.float8_e4m3fn)
-
-                    # Direct continuous copy
-                    k_buffer_dq[
-                        cur_token_idx_dq_buffer_cpu : cur_token_idx_dq_buffer_cpu
-                        + prev_len
-                    ] = k_prev_fp8
-                    v_buffer_dq[
-                        cur_token_idx_dq_buffer_cpu : cur_token_idx_dq_buffer_cpu
-                        + prev_len
-                    ] = v_prev_fp8
-
-                # Write of current chunk
-                cur_end = cur_batch_start_loc_cpu + extend_len
-                k_cur_chunk = k_cur_fp8[cur_batch_start_loc_cpu:cur_end]
-                v_cur_chunk = v_cur_fp8[cur_batch_start_loc_cpu:cur_end]
-                k_buffer_dq[
-                    cur_token_idx_dq_buffer_cpu
-                    + prev_len : cur_token_idx_dq_buffer_cpu
-                    + prev_len
-                    + extend_len
-                ] = k_cur_chunk
-                v_buffer_dq[
-                    cur_token_idx_dq_buffer_cpu
-                    + prev_len : cur_token_idx_dq_buffer_cpu
-                    + prev_len
-                    + extend_len
-                ] = v_cur_chunk
-
-                cur_batch_start_loc_cpu = cur_end
-                # align to page size
-                cur_token_idx_dq_buffer_cpu = (
-                    (
-                        cur_token_idx_dq_buffer_cpu
-                        + prev_len
-                        + extend_len
-                        + self.page_size
-                        - 1
-                    )
-                    // self.page_size
-                    * self.page_size
-                )
 
             k_paged = k_buffer_dq.view(
                 -1, self.page_size, layer.tp_k_head_num, layer.head_dim
@@ -1170,12 +1026,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend(include_v2=True)
         ):
-            k_cache, k_cache_scales = forward_batch.token_to_kv_pool.get_fp4_key_buffer(
-                layer.layer_id
-            )
-            v_cache, v_cache_scales = (
-                forward_batch.token_to_kv_pool.get_fp4_value_buffer(layer.layer_id)
-            )
+            # MTP path: no dequant — directly pass FP4 + scales to XQA decode kernel
+            raw = pool.get_raw_kv_buffer(layer.layer_id)
+            k_cache, k_cache_scales = raw["k"], raw["k_scale"]
+            v_cache, v_cache_scales = raw["v"], raw["v_scale"]
+
             k_cache = k_cache.view(
                 -1, self.page_size, layer.tp_k_head_num, layer.head_dim // 2
             ).permute(0, 2, 1, 3)
@@ -1203,9 +1058,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         else:
             # bf16/fp8, all paths
             # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
-            k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
-                layer.layer_id
-            )
+            k_cache, v_cache = pool.get_kv_buffer(layer.layer_id)
             k_cache = k_cache.view(
                 -1, self.page_size, layer.tp_k_head_num, layer.head_dim
             ).permute(0, 2, 1, 3)

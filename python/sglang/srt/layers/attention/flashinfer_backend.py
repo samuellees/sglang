@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
 import torch
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
-from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -109,62 +108,6 @@ global_workspace_buffer = None
 # Use as a fast path to override the indptr in flashinfer's plan function
 # This is used to remove some host-to-device copy overhead.
 global_override_indptr_cpu = None
-
-
-def _preload_kv_scales(
-    config: ModelConfig, model_runner: ModelRunner, is_sm100_supported: bool
-):
-    num_layers = config.num_hidden_layers
-    k_scales_cpu = torch.ones(num_layers, dtype=torch.float32, device="cpu")
-    v_scales_cpu = torch.ones(num_layers, dtype=torch.float32, device="cpu")
-
-    from sglang.srt.model_executor.model_runner import resolve_language_model
-
-    attention_layers = []
-    language_model = resolve_language_model(model_runner.model)
-    for layer in language_model.layers:
-        if hasattr(layer, "self_attn"):
-            if hasattr(layer.self_attn, "attn"):
-                attention_layers.append(layer.self_attn.attn)
-            elif hasattr(layer.self_attn, "attn_mqa"):
-                attention_layers.append(layer.self_attn.attn_mqa)
-        elif hasattr(layer, "attn"):
-            attention_layers.append(layer.attn)
-        elif hasattr(layer, "attention"):
-            if hasattr(layer.attention, "attn"):
-                attention_layers.append(layer.attention.attn)
-
-    for layer in attention_layers:
-        layer_id = layer.layer_id
-        if layer_id >= len(v_scales_cpu):
-            continue
-
-        # prepare k/v global scale
-        if not hasattr(layer, "k_scale") or layer.k_scale is None:
-            k_scale = 1.0
-        else:
-            k_scale = layer.k_scale
-        if not hasattr(layer, "v_scale") or layer.v_scale is None:
-            v_scale = 1.0
-        else:
-            v_scale = layer.v_scale
-
-        if is_sm100_supported:
-            k_scale = k_scale * 6.0
-            v_scale = v_scale * 6.0
-
-        k_scales_cpu[layer_id] = k_scale
-        v_scales_cpu[layer_id] = v_scale
-
-    k_scales_gpu = torch.ones(
-        num_layers, dtype=torch.float32, device=model_runner.device
-    )
-    v_scales_gpu = torch.ones(
-        num_layers, dtype=torch.float32, device=model_runner.device
-    )
-    k_scales_gpu.copy_(k_scales_cpu, non_blocking=True)
-    v_scales_gpu.copy_(v_scales_cpu, non_blocking=True)
-    return k_scales_gpu, v_scales_gpu
 
 
 class FlashInferAttnBackend(AttentionBackend):
@@ -370,12 +313,6 @@ class FlashInferAttnBackend(AttentionBackend):
         self.prefill_cuda_graph_metadata = {}  # For verify
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
 
-        # NVFP4 KV Cache
-        if self.is_nvfp4_kvcache:
-            self.is_sm100_supported = is_sm100_supported()
-            self.k_scales_gpu, self.v_scales_gpu = _preload_kv_scales(
-                model_runner.model_config, model_runner, self.is_sm100_supported
-            )
         self.page_size = model_runner.page_size
 
     def _process_multi_item_scoring(
@@ -880,108 +817,6 @@ class FlashInferAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
-    def _dequant_nvfp4_kv_for_extend_base(
-        self,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        layer: RadixAttention,
-        forward_batch: ForwardBatch,
-        transfer_cur_chunk_kv: bool = True,
-    ):
-
-        cur_k_scale_gpu = self.k_scales_gpu[layer.layer_id : layer.layer_id + 1]
-        cur_v_scale_gpu = self.v_scales_gpu[layer.layer_id : layer.layer_id + 1]
-
-        from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4QuantizeUtil
-
-        batch_size = forward_batch.batch_size
-
-        k_buffer_nvfp4, k_scales_buffer = (
-            forward_batch.token_to_kv_pool.get_fp4_key_buffer(layer.layer_id)
-        )
-        v_buffer_nvfp4, v_scales_buffer = (
-            forward_batch.token_to_kv_pool.get_fp4_value_buffer(layer.layer_id)
-        )
-        k_buffer_dq, v_buffer_dq = forward_batch.token_to_kv_pool.get_dq_kv_buffer()
-
-        # Convert current k/v to fp8 once
-        if transfer_cur_chunk_kv:
-            k_cur_fp8 = k.to(torch.float8_e4m3fn)
-            v_cur_fp8 = v.to(torch.float8_e4m3fn)
-
-        # Process each request in batch
-        cur_batch_start_loc_cpu = 0
-        # skip first page for dummy output
-        cur_token_idx_dq_buffer_cpu = self.page_size
-        for batch_idx in range(batch_size):
-            req_pool_idx = self.cpu_req_pool_indices[batch_idx]
-            prev_len = forward_batch.extend_prefix_lens_cpu[batch_idx]
-            extend_len = forward_batch.extend_seq_lens_cpu[batch_idx]
-
-            # Dequantize and copy previous KV
-            if prev_len > 0:
-                prev_token_indices = forward_batch.req_to_token_pool.req_to_token[
-                    req_pool_idx, :prev_len
-                ]
-                k_prev_nvfp4 = k_buffer_nvfp4[prev_token_indices]
-                k_prev_scales = k_scales_buffer[prev_token_indices]
-                v_prev_nvfp4 = v_buffer_nvfp4[prev_token_indices]
-                v_prev_scales = v_scales_buffer[prev_token_indices]
-
-                # Dequantize: [prev_len, num_heads, head_dim]
-                k_prev_bf16 = NVFP4QuantizeUtil.cuda_nvfp4_dequantize(
-                    k_prev_nvfp4.view(torch.uint8),
-                    k_prev_scales,
-                    cur_k_scale_gpu,
-                )
-                v_prev_bf16 = NVFP4QuantizeUtil.cuda_nvfp4_dequantize(
-                    v_prev_nvfp4.view(torch.uint8),
-                    v_prev_scales,
-                    cur_v_scale_gpu,
-                )
-                k_prev_fp8 = k_prev_bf16.to(torch.float8_e4m3fn)
-                v_prev_fp8 = v_prev_bf16.to(torch.float8_e4m3fn)
-
-                # Direct continuous copy
-                k_buffer_dq[
-                    cur_token_idx_dq_buffer_cpu : cur_token_idx_dq_buffer_cpu + prev_len
-                ] = k_prev_fp8
-                v_buffer_dq[
-                    cur_token_idx_dq_buffer_cpu : cur_token_idx_dq_buffer_cpu + prev_len
-                ] = v_prev_fp8
-
-            # Write of current chunk
-            if transfer_cur_chunk_kv:
-                cur_end = cur_batch_start_loc_cpu + extend_len
-                k_cur_chunk = k_cur_fp8[cur_batch_start_loc_cpu:cur_end]
-                v_cur_chunk = v_cur_fp8[cur_batch_start_loc_cpu:cur_end]
-                k_buffer_dq[
-                    cur_token_idx_dq_buffer_cpu
-                    + prev_len : cur_token_idx_dq_buffer_cpu
-                    + prev_len
-                    + extend_len
-                ] = k_cur_chunk
-                v_buffer_dq[
-                    cur_token_idx_dq_buffer_cpu
-                    + prev_len : cur_token_idx_dq_buffer_cpu
-                    + prev_len
-                    + extend_len
-                ] = v_cur_chunk
-                cur_batch_start_loc_cpu = cur_end
-
-            # align to page size
-            cur_token_idx_dq_buffer_cpu = (
-                (
-                    cur_token_idx_dq_buffer_cpu
-                    + prev_len
-                    + extend_len
-                    + self.page_size
-                    - 1
-                )
-                // self.page_size
-                * self.page_size
-            )
-
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1009,41 +844,46 @@ class FlashInferAttnBackend(AttentionBackend):
         ), "NVFP4 dequant KV cache is not supported for cross-attention"
 
         # We perform dequant for chunk prefill/cache reuse.
+        pool = forward_batch.token_to_kv_pool
         if self.is_nvfp4_kvcache:
             if self.dq_page_table is not None:
-                self._dequant_nvfp4_kv_for_extend_base(
-                    k, v, layer, forward_batch, self.transfer_cur_chunk_kv
+                # For paged path (not use_ragged), the paged attention uses the dq buffer for
+                # ALL tokens (prefix + current chunk). Current chunk must be written to dq workspace.
+                # For ragged path (use_ragged), flashinfer handles new-to-new with raw k/v; dq not used.
+                transfer_cur_kv = not self.forward_metadata.use_ragged
+                k_cur_fp8 = (
+                    k.to(torch.float8_e4m3fn)
+                    if (k is not None and transfer_cur_kv)
+                    else None
                 )
-            k_buffer_dq, v_buffer_dq = forward_batch.token_to_kv_pool.get_dq_kv_buffer()
+                v_cur_fp8 = (
+                    v.to(torch.float8_e4m3fn)
+                    if (v is not None and transfer_cur_kv)
+                    else None
+                )
+                pool.dequant_kv_for_extend(
+                    layer.layer_id,
+                    forward_batch.req_to_token_pool.req_to_token,
+                    self.cpu_req_pool_indices,
+                    forward_batch.extend_prefix_lens_cpu,
+                    forward_batch.extend_seq_lens_cpu,
+                    self.page_size,
+                    k_cur_fp8=k_cur_fp8,
+                    v_cur_fp8=v_cur_fp8,
+                )
+            k_buffer_dq, v_buffer_dq = pool.get_dq_kv_buffer()
             k_paged = k_buffer_dq.view(-1, layer.tp_k_head_num, layer.head_dim)
             v_paged = v_buffer_dq.view(-1, layer.tp_v_head_num, layer.head_dim)
             kv_cache = (k_paged, v_paged)
         else:
-            kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            kv_cache = pool.get_kv_buffer(layer.layer_id)
 
         # use paged attention
         if not self.forward_metadata.use_ragged:
             if k is not None and save_kv_cache:
                 assert v is not None
-                if self.is_nvfp4_kvcache:
-                    cur_k_scale_gpu = self.k_scales_gpu[
-                        layer.layer_id : layer.layer_id + 1
-                    ]
-                    cur_v_scale_gpu = self.v_scales_gpu[
-                        layer.layer_id : layer.layer_id + 1
-                    ]
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer,
-                        cache_loc,
-                        k,
-                        v,
-                        cur_k_scale_gpu,
-                        cur_v_scale_gpu,
-                    )
-                else:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                    )
+                # For NVFP4, global scales are auto-resolved from pool.quant_method.
+                pool.set_kv_buffer(layer, cache_loc, k, v, layer.k_scale, layer.v_scale)
 
             # We need to process the paged part for nvfp4 kv cache
             o = prefill_wrapper_paged.forward(
@@ -1128,25 +968,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 o, _ = merge_state(o1, s1, o2, s2)
 
             if save_kv_cache:
-                if self.is_nvfp4_kvcache:
-                    cur_k_scale_gpu = self.k_scales_gpu[
-                        layer.layer_id : layer.layer_id + 1
-                    ]
-                    cur_v_scale_gpu = self.v_scales_gpu[
-                        layer.layer_id : layer.layer_id + 1
-                    ]
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer,
-                        cache_loc,
-                        k,
-                        v,
-                        cur_k_scale_gpu,
-                        cur_v_scale_gpu,
-                    )
-                else:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                    )
+                # For NVFP4, global scales are auto-resolved from pool.quant_method.
+                pool.set_kv_buffer(layer, cache_loc, k, v, layer.k_scale, layer.v_scale)
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 

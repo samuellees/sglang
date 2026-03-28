@@ -45,7 +45,6 @@ from sglang.srt.layers.attention.nsa.quant_k_cache import (
     quantize_k_cache,
     quantize_k_cache_separate,
 )
-from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4QuantizeUtil
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
@@ -62,7 +61,6 @@ from sglang.srt.utils import (
     is_npu,
     next_power_of_2,
 )
-from sglang.srt.utils.common import is_sm100_supported, is_sm120_supported
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -744,6 +742,7 @@ class MHATokenToKVPool(KVCache):
         end_layer: Optional[int] = None,
         enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
+        quant_method=None,
     ):
         super().__init__(
             size,
@@ -762,6 +761,10 @@ class MHATokenToKVPool(KVCache):
             if swa_v_head_dim is not None
             else v_head_dim if v_head_dim is not None else head_dim
         )
+
+        from sglang.srt.layers.quantization.kv_cache_quant_method import NoneMethod
+
+        self.quant_method = quant_method if quant_method is not None else NoneMethod()
 
         self._create_buffers()
 
@@ -829,6 +832,29 @@ class MHATokenToKVPool(KVCache):
         )
 
     def _create_buffers(self):
+        from sglang.srt.layers.quantization.kv_cache_quant_method import NoneMethod
+
+        if not isinstance(self.quant_method, NoneMethod):
+            # Delegate buffer creation to quant_method (e.g. NVFP4Method, MXFP4Method)
+            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+                with (
+                    torch.cuda.use_mem_pool(self.custom_mem_pool)
+                    if self.enable_custom_mem_pool
+                    else nullcontext()
+                ):
+                    m = self.size + self.page_size
+                    buf = self.quant_method.create_buffers(
+                        m, self.head_num, self.head_dim, self.layer_num, self.device
+                    )
+            self.k_buffer = buf["k_buffer"]
+            self.v_buffer = buf["v_buffer"]
+            self.k_scale_buffer = buf.get("k_scale_buffer")
+            self.v_scale_buffer = buf.get("v_scale_buffer")
+            self.dq_k_buffer = buf.get("dq_k_buffer")
+            self.dq_v_buffer = buf.get("dq_v_buffer")
+            self.store_dtype = buf.get("store_dtype", torch.uint8)
+            return
+
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -876,6 +902,14 @@ class MHATokenToKVPool(KVCache):
     def _clear_buffers(self):
         del self.k_buffer
         del self.v_buffer
+        if hasattr(self, "k_scale_buffer") and self.k_scale_buffer is not None:
+            del self.k_scale_buffer
+        if hasattr(self, "v_scale_buffer") and self.v_scale_buffer is not None:
+            del self.v_scale_buffer
+        if hasattr(self, "dq_k_buffer") and self.dq_k_buffer is not None:
+            del self.dq_k_buffer
+        if hasattr(self, "dq_v_buffer") and self.dq_v_buffer is not None:
+            del self.dq_v_buffer
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "k_buffer")
@@ -987,11 +1021,50 @@ class MHATokenToKVPool(KVCache):
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
+        global_layer_id_override: Optional[int] = None,
     ):
-        if layer_id_override is not None:
-            layer_id = layer_id_override
+        # global_layer_id: used for per-layer scale lookup (always global/absolute).
+        # layer_id: used for buffer indexing (may be local/0-based via HybridLinearKVPool).
+        if layer is not None:
+            global_layer_id = (
+                global_layer_id_override
+                if global_layer_id_override is not None
+                else layer.layer_id
+            )
+            layer_id = (
+                layer_id_override if layer_id_override is not None else layer.layer_id
+            )
         else:
-            layer_id = layer.layer_id
+            # Called from HybridLinearKVPool with layer=None; both overrides must be provided.
+            global_layer_id = global_layer_id_override
+            layer_id = layer_id_override
+
+        from sglang.srt.layers.quantization.kv_cache_quant_method import NoneMethod
+
+        if not isinstance(self.quant_method, NoneMethod):
+            # Delegate quantization + write to quant_method.
+            # Always use global_layer_id for scale lookup (scales are indexed by global layer id).
+            idx = layer_id - self.start_layer
+            if k_scale is None and hasattr(self.quant_method, "k_scales_gpu"):
+                k_scale = self.quant_method.k_scales_gpu[
+                    global_layer_id : global_layer_id + 1
+                ]
+                v_scale = self.quant_method.v_scales_gpu[
+                    global_layer_id : global_layer_id + 1
+                ]
+            self.quant_method.quantize_and_store(
+                self.k_buffer[idx],
+                self.v_buffer[idx],
+                self.k_scale_buffer[idx] if self.k_scale_buffer else None,
+                self.v_scale_buffer[idx] if self.v_scale_buffer else None,
+                loc,
+                cache_k,
+                cache_v,
+                k_scale,
+                v_scale,
+            )
+            return
+
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)
@@ -1016,6 +1089,121 @@ class MHATokenToKVPool(KVCache):
             alt_stream=self.alt_stream,
             same_kv_dim=self.same_kv_dim,
         )
+
+    def get_raw_kv_buffer(self, layer_id: int) -> dict:
+        """Return the raw quantized KV buffers for a layer (for native FP4 kernels).
+
+        Returns dict with keys: "k", "v", "k_scale", "v_scale"
+        For NVFP4: k/v are uint8 (packed FP4), k_scale/v_scale are FP8 E4M3.
+        """
+        idx = layer_id - self.start_layer
+        result = {"k": self.k_buffer[idx], "v": self.v_buffer[idx]}
+        if hasattr(self, "k_scale_buffer") and self.k_scale_buffer is not None:
+            result["k_scale"] = self.k_scale_buffer[idx].view(torch.float8_e4m3fn)
+            result["v_scale"] = self.v_scale_buffer[idx].view(torch.float8_e4m3fn)
+        return result
+
+    # Backward-compatible accessors for attention backends
+    def get_fp4_key_buffer(self, layer_id: int):
+        raw = self.get_raw_kv_buffer(layer_id)
+        return raw["k"], raw["k_scale"]
+
+    def get_fp4_value_buffer(self, layer_id: int):
+        raw = self.get_raw_kv_buffer(layer_id)
+        return raw["v"], raw["v_scale"]
+
+    def get_dq_kv_buffer(self) -> tuple:
+        """Return the shared dequant workspace (dq_k_buffer, dq_v_buffer)."""
+        return self.dq_k_buffer, self.dq_v_buffer
+
+    def dequant_kv_for_extend(
+        self,
+        layer_id: int,
+        req_to_token: torch.Tensor,
+        req_pool_indices_cpu,
+        extend_prefix_lens_cpu,
+        extend_seq_lens_cpu,
+        page_size: int,
+        k_cur_fp8: Optional[torch.Tensor] = None,
+        v_cur_fp8: Optional[torch.Tensor] = None,
+        global_layer_id: Optional[int] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Batch dequant FP4 KV into the shared dq_buffer for prefill/extend.
+
+        Extracts the common dequant loop shared by flashinfer and trtllm backends.
+        The actual dequantize computation is delegated to self.quant_method.
+
+        Args:
+            layer_id: Local (0-based) layer index used for buffer indexing.
+            req_to_token: req_to_token_pool.req_to_token tensor.
+            req_pool_indices_cpu: CPU list/tensor of request pool indices.
+            extend_prefix_lens_cpu: CPU list of prefix lengths per request.
+            extend_seq_lens_cpu: CPU list of extend (new chunk) lengths per request.
+            page_size: Page size used for page-aligned dq_buffer layout.
+            k_cur_fp8: Current chunk K cast to FP8, shape [total_extend, heads, dim].
+                       If None, current chunk is not written (flashinfer with
+                       transfer_cur_chunk_kv=False).
+            v_cur_fp8: Same for V.
+            global_layer_id: Global (absolute) layer index for scale lookup.
+                             Defaults to layer_id when not provided (non-hybrid path).
+
+        Returns:
+            (dq_k_buffer, dq_v_buffer) — the shared workspace tensors.
+        """
+        if global_layer_id is None:
+            global_layer_id = layer_id
+        raw = self.get_raw_kv_buffer(layer_id)
+        k_fp4 = raw["k"]
+        k_scales = raw["k_scale"]
+        v_fp4 = raw["v"]
+        v_scales = raw["v_scale"]
+        dq_k, dq_v = self.dq_k_buffer, self.dq_v_buffer
+
+        batch_size = len(req_pool_indices_cpu)
+        cur_batch_start_loc_cpu = 0
+        cur_token_idx_dq = page_size  # skip page 0 (dummy output slot)
+
+        for i in range(batch_size):
+            req_idx = int(req_pool_indices_cpu[i])
+            prev_len = int(extend_prefix_lens_cpu[i])
+            extend_len = int(extend_seq_lens_cpu[i])
+
+            if prev_len > 0:
+                prev_indices = req_to_token[req_idx, :prev_len]
+                k_prev_fp8, v_prev_fp8 = self.quant_method.dequantize_prev_kv(
+                    k_fp4[prev_indices],
+                    k_scales[prev_indices],
+                    v_fp4[prev_indices],
+                    v_scales[prev_indices],
+                    global_layer_id,
+                )
+                dq_k[cur_token_idx_dq : cur_token_idx_dq + prev_len] = k_prev_fp8
+                dq_v[cur_token_idx_dq : cur_token_idx_dq + prev_len] = v_prev_fp8
+
+            if k_cur_fp8 is not None:
+                cur_end = cur_batch_start_loc_cpu + extend_len
+                dq_k[
+                    cur_token_idx_dq
+                    + prev_len : cur_token_idx_dq
+                    + prev_len
+                    + extend_len
+                ] = k_cur_fp8[cur_batch_start_loc_cpu:cur_end]
+                dq_v[
+                    cur_token_idx_dq
+                    + prev_len : cur_token_idx_dq
+                    + prev_len
+                    + extend_len
+                ] = v_cur_fp8[cur_batch_start_loc_cpu:cur_end]
+                cur_batch_start_loc_cpu = cur_end
+
+            # Advance to next page-aligned position
+            cur_token_idx_dq = (
+                (cur_token_idx_dq + prev_len + extend_len + page_size - 1)
+                // page_size
+                * page_size
+            )
+
+        return dq_k, dq_v
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
@@ -1067,328 +1255,6 @@ class MHATokenToKVPool(KVCache):
             )
 
 
-class MHATokenToKVPoolNVFP4(MHATokenToKVPool):
-
-    def _create_buffers(self):
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            with (
-                torch.cuda.use_mem_pool(self.custom_mem_pool)
-                if self.enable_custom_mem_pool
-                else nullcontext()
-            ):
-                # [size, head_num, head_dim] for each layer
-                # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                m = self.size + self.page_size
-                n = self.head_num
-                k = self.head_dim
-
-                scale_block_size = 16
-                self.store_dtype = torch.uint8
-                self.k_buffer = [
-                    torch.zeros(
-                        (m, n, k // 2),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-                self.v_buffer = [
-                    torch.zeros(
-                        (m, n, k // 2),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-
-                self.k_scale_buffer = [
-                    torch.zeros(
-                        (m, n, k // scale_block_size),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-                self.v_scale_buffer = [
-                    torch.zeros(
-                        (m, n, k // scale_block_size),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-
-                self.dq_dtype = torch.float8_e4m3fn
-                self.dq_k_buffer = torch.zeros(
-                    (m, n, k),
-                    dtype=self.dq_dtype,
-                    device=self.device,
-                )
-                self.dq_v_buffer = torch.zeros(
-                    (m, n, k),
-                    dtype=self.dq_dtype,
-                    device=self.device,
-                )
-
-    def _clear_buffers(self):
-        del self.k_buffer
-        del self.v_buffer
-        del self.k_scale_buffer
-        del self.v_scale_buffer
-        del self.dq_k_buffer
-        del self.dq_v_buffer
-
-    def _get_key_nvfp4_from_nvfp4_buffer(self, layer_id: int):
-        return (
-            self.k_buffer[layer_id - self.start_layer],
-            self.k_scale_buffer[layer_id - self.start_layer].view(torch.float8_e4m3fn),
-        )
-
-    def _get_value_nvfp4_from_nvfp4_buffer(self, layer_id: int):
-        return (
-            self.v_buffer[layer_id - self.start_layer],
-            self.v_scale_buffer[layer_id - self.start_layer].view(torch.float8_e4m3fn),
-        )
-
-    def get_fp4_value_buffer(self, layer_id: int):
-        return self._get_value_nvfp4_from_nvfp4_buffer(layer_id)
-
-    def get_fp4_key_buffer(self, layer_id: int):
-        return self._get_key_nvfp4_from_nvfp4_buffer(layer_id)
-
-    def _get_key_buffer(self, layer_id: int, k_global_scale: float):
-        # for internal use of referencing
-        cache_k_nope_fp4 = self.k_buffer[layer_id - self.start_layer].view(torch.uint8)
-        cache_k_nope_fp4_sf = self.k_scale_buffer[layer_id - self.start_layer].view(
-            torch.float8_e4m3fn
-        )
-
-        cache_k_nope_fp4_dequant = NVFP4QuantizeUtil.cuda_nvfp4_dequantize(
-            cache_k_nope_fp4, cache_k_nope_fp4_sf, k_global_scale
-        )
-        return cache_k_nope_fp4_dequant
-
-    def _get_value_buffer(self, layer_id: int, v_global_scale: float):
-        # for internal use of referencing
-        cache_v_nope_fp4 = self.v_buffer[layer_id - self.start_layer].view(torch.uint8)
-        cache_v_nope_fp4_sf = self.v_scale_buffer[layer_id - self.start_layer].view(
-            torch.float8_e4m3fn
-        )
-
-        cache_v_nope_fp4_dequant = NVFP4QuantizeUtil.cuda_nvfp4_dequantize(
-            cache_v_nope_fp4, cache_v_nope_fp4_sf, v_global_scale
-        )
-        return cache_v_nope_fp4_dequant
-
-    def get_kv_buffer(self, layer_id: int, scale_k: float, scale_v: float):
-        return self.get_key_buffer(layer_id, scale_k), self.get_value_buffer(
-            layer_id, scale_v
-        )
-
-    # cache_k and cache_v are in bf16 format
-    def set_kv_buffer(
-        self,
-        layer: RadixAttention,
-        loc: torch.Tensor,
-        cache_k: torch.Tensor,
-        cache_v: torch.Tensor,
-        k_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
-        layer_id_override: Optional[int] = None,
-    ):
-        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-
-        if layer_id_override is not None:
-            layer_id = layer_id_override
-        else:
-            layer_id = layer.layer_id
-
-        if is_sm100_supported() or is_sm120_supported():
-            cache_k, cache_k_fp4_sf, _ = (
-                NVFP4QuantizeUtil.cuda_nvfp4_quantize_blackwell(cache_k, k_scale)
-            )
-            cache_v, cache_v_fp4_sf, _ = (
-                NVFP4QuantizeUtil.cuda_nvfp4_quantize_blackwell(cache_v, v_scale)
-            )
-        else:
-            cache_k, cache_k_fp4_sf, _ = NVFP4QuantizeUtil.batched_quantize(
-                cache_k, k_scale
-            )
-            cache_v, cache_v_fp4_sf, _ = NVFP4QuantizeUtil.batched_quantize(
-                cache_v, v_scale
-            )
-
-        cache_k = cache_k.view(torch.uint8)
-        cache_v = cache_v.view(torch.uint8)
-
-        cache_k_fp4_sf = cache_k_fp4_sf.view(torch.uint8)
-        cache_v_fp4_sf = cache_v_fp4_sf.view(torch.uint8)
-
-        if get_is_capture_mode() and self.alt_stream is not None:
-            # Overlap the copy of K and V cache for small batch size
-            current_stream = self.device_module.current_stream()
-            self.alt_stream.wait_stream(current_stream)
-            self.k_buffer[layer_id - self.start_layer][loc] = cache_k
-
-            self.k_scale_buffer[layer_id - self.start_layer][loc] = cache_k_fp4_sf
-            with self.device_module.stream(self.alt_stream):
-                self.v_buffer[layer_id - self.start_layer][loc] = cache_v
-
-                self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_fp4_sf
-            current_stream.wait_stream(self.alt_stream)
-        else:
-            self.k_buffer[layer_id - self.start_layer][loc] = cache_k
-            self.v_buffer[layer_id - self.start_layer][loc] = cache_v
-
-            self.k_scale_buffer[layer_id - self.start_layer][loc] = cache_k_fp4_sf
-            self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_fp4_sf
-
-    def get_dq_kv_buffer(
-        self,
-    ):
-        return (self.dq_k_buffer, self.dq_v_buffer)
-
-
-class MHATokenToKVPoolFP4(MHATokenToKVPool):
-
-    def _create_buffers(self):
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            with (
-                torch.cuda.use_mem_pool(self.custom_mem_pool)
-                if self.enable_custom_mem_pool
-                else nullcontext()
-            ):
-                # [size, head_num, head_dim] for each layer
-                # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                m = self.size + self.page_size
-                n = self.head_num
-                k = self.head_dim
-
-                scale_block_size = 16
-                self.store_dtype = torch.uint8
-                self.k_buffer = [
-                    torch.zeros(
-                        (m, n, k // 2),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-                self.v_buffer = [
-                    torch.zeros(
-                        (m, n, k // 2),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-
-                self.k_scale_buffer = [
-                    torch.zeros(
-                        (m, (n * k) // scale_block_size),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-                self.v_scale_buffer = [
-                    torch.zeros(
-                        (m, (n * k) // scale_block_size),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-        from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
-
-        self.fp4_quant_util = KVFP4QuantizeUtil
-
-    def _clear_buffers(self):
-        del self.k_buffer
-        del self.v_buffer
-        del self.k_scale_buffer
-        del self.v_scale_buffer
-
-    def _get_key_buffer(self, layer_id: int):
-        # for internal use of referencing
-        if self.store_dtype != self.dtype:
-            cache_k_nope_fp4 = self.k_buffer[layer_id - self.start_layer].view(
-                torch.uint8
-            )
-            cache_k_nope_fp4_sf = self.k_scale_buffer[layer_id - self.start_layer]
-
-            cache_k_nope_fp4_dequant = self.fp4_quant_util.cuda_nvfp4_dequantize(
-                cache_k_nope_fp4, cache_k_nope_fp4_sf
-            )
-            return cache_k_nope_fp4_dequant
-        return self.k_buffer[layer_id - self.start_layer]
-
-    def _get_value_buffer(self, layer_id: int):
-        # for internal use of referencing
-        if self.store_dtype != self.dtype:
-            cache_v_nope_fp4 = self.v_buffer[layer_id - self.start_layer].view(
-                torch.uint8
-            )
-            cache_v_nope_fp4_sf = self.v_scale_buffer[layer_id - self.start_layer]
-
-            cache_v_nope_fp4_dequant = self.fp4_quant_util.cuda_nvfp4_dequantize(
-                cache_v_nope_fp4, cache_v_nope_fp4_sf
-            )
-            return cache_v_nope_fp4_dequant
-        return self.v_buffer[layer_id - self.start_layer]
-
-    def set_kv_buffer(
-        self,
-        layer: RadixAttention,
-        loc: torch.Tensor,
-        cache_k: torch.Tensor,
-        cache_v: torch.Tensor,
-        k_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
-        layer_id_override: Optional[int] = None,
-    ):
-        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-
-        if layer_id_override is not None:
-            layer_id = layer_id_override
-        else:
-            layer_id = layer.layer_id
-        if cache_k.dtype != self.dtype:
-            if k_scale is not None:
-                cache_k.div_(k_scale)
-            if v_scale is not None:
-                cache_v.div_(v_scale)
-
-            cache_k, cache_k_fp4_sf = self.fp4_quant_util.batched_quantize(cache_k)
-            cache_v, cache_v_fp4_sf = self.fp4_quant_util.batched_quantize(cache_v)
-
-        if self.store_dtype != self.dtype:
-            cache_k = cache_k.view(self.store_dtype)
-            cache_v = cache_v.view(self.store_dtype)
-
-            cache_k_fp4_sf = cache_k_fp4_sf.view(self.store_dtype)
-            cache_v_fp4_sf = cache_v_fp4_sf.view(self.store_dtype)
-
-        if get_is_capture_mode() and self.alt_stream is not None:
-            # Overlap the copy of K and V cache for small batch size
-            current_stream = self.device_module.current_stream()
-            self.alt_stream.wait_stream(current_stream)
-            self.k_buffer[layer_id - self.start_layer][loc] = cache_k
-
-            self.k_scale_buffer[layer_id - self.start_layer][loc] = cache_k_fp4_sf
-            with self.device_module.stream(self.alt_stream):
-                self.v_buffer[layer_id - self.start_layer][loc] = cache_v
-
-                self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_fp4_sf
-            current_stream.wait_stream(self.alt_stream)
-        else:
-            self.k_buffer[layer_id - self.start_layer][loc] = cache_k
-            self.v_buffer[layer_id - self.start_layer][loc] = cache_v
-
-            self.k_scale_buffer[layer_id - self.start_layer][loc] = cache_k_fp4_sf
-            self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_fp4_sf
-
-
 class HybridLinearKVPool(KVCache):
     """KV cache with separate pools for full and linear attention layers."""
 
@@ -1408,6 +1274,7 @@ class HybridLinearKVPool(KVCache):
         use_mla: bool = False,
         kv_lora_rank: int = None,
         qk_rope_head_dim: int = None,
+        quant_method=None,
     ):
         self.size = size
         self.dtype = dtype
@@ -1424,13 +1291,6 @@ class HybridLinearKVPool(KVCache):
         self.use_mla = use_mla
         if not use_mla:
 
-            if is_float4_e2m1fn_x2(dtype):
-                # TODO(Sam): Add a env flag to choose between NVFP4 and other FP4
-                # TokenToKVPoolClass = MHATokenToKVPoolFP4
-                TokenToKVPoolClass = MHATokenToKVPoolNVFP4
-            else:
-                TokenToKVPoolClass = MHATokenToKVPool
-
             if _is_npu:
                 assert not is_float4_e2m1fn_x2(
                     dtype
@@ -1440,6 +1300,10 @@ class HybridLinearKVPool(KVCache):
                 )
 
                 TokenToKVPoolClass = NPUMHATokenToKVPool
+                quant_method_kwarg = {}
+            else:
+                TokenToKVPoolClass = MHATokenToKVPool
+                quant_method_kwarg = {"quant_method": quant_method}
 
             self.full_kv_pool = TokenToKVPoolClass(
                 size=size,
@@ -1450,6 +1314,7 @@ class HybridLinearKVPool(KVCache):
                 layer_num=self.full_layer_nums,
                 device=device,
                 enable_memory_saver=enable_memory_saver,
+                **quant_method_kwarg,
             )
         else:
 
@@ -1534,6 +1399,17 @@ class HybridLinearKVPool(KVCache):
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool._get_key_nvfp4_from_nvfp4_buffer(layer_id)
 
+    def get_raw_kv_buffer(self, layer_id: int):
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_raw_kv_buffer(layer_id)
+
+    def dequant_kv_for_extend(self, layer_id: int, *args, **kwargs):
+        global_layer_id = layer_id  # save global id before converting to local
+        local_layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.dequant_kv_for_extend(
+            local_layer_id, *args, global_layer_id=global_layer_id, **kwargs
+        )
+
     def get_dq_kv_buffer(
         self,
     ):
@@ -1566,7 +1442,10 @@ class HybridLinearKVPool(KVCache):
         k_scale: float = 1.0,
         v_scale: float = 1.0,
     ):
-        layer_id = self._transfer_full_attention_id(layer.layer_id)
+        global_layer_id = layer.layer_id  # absolute global id for scale lookup
+        layer_id = self._transfer_full_attention_id(
+            layer.layer_id
+        )  # local id for buffer indexing
         if not self.use_mla:
             self.full_kv_pool.set_kv_buffer(
                 None,
@@ -1576,6 +1455,7 @@ class HybridLinearKVPool(KVCache):
                 k_scale,
                 v_scale,
                 layer_id_override=layer_id,
+                global_layer_id_override=global_layer_id,
             )
         else:
             with self._transfer_id_context(layer):
