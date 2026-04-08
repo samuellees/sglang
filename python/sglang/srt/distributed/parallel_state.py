@@ -576,18 +576,21 @@ class GroupCoordinator:
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
             return self.npu_communicator.all_reduce(input_)
 
-        if self.pynccl_comm is not None and self.is_symmetric_memory_enabled():
-            with self.pynccl_comm.change_state(enable=True):
-                self.pynccl_comm.all_reduce(input_)
-                return input_
-
         outplace_all_reduce_method = None
         if (
             self.ca_comm is not None
             and not self.ca_comm.disabled
             and self.ca_comm.should_custom_ar(input_)
         ):
+            # Custom AR handles small/medium tensors in both eager and graph.
+            # Works with symm-mem because is_allreduce_allocation_symmetric()
+            # ensures allreduce inputs use cudaMalloc during graph capture.
             outplace_all_reduce_method = "ca"
+        elif self.pynccl_comm is not None and self.is_symmetric_memory_enabled():
+            # NCCL symmetric memory fallback for tensors CA can't handle.
+            with self.pynccl_comm.change_state(enable=True):
+                self.pynccl_comm.all_reduce(input_)
+                return input_
         elif (
             self.qr_comm is not None
             and not self.qr_comm.disabled
