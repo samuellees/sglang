@@ -25,6 +25,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
+    is_allocation_symmetric,
     is_allreduce_allocation_symmetric,
 )
 from sglang.srt.layers.parameter import (
@@ -1507,7 +1508,7 @@ class RowParallelLinear(LinearBase):
             symm_ctx = use_symmetric_memory(get_attention_tp_group())
         else:
             symm_ctx = use_symmetric_memory(
-                get_tp_group(), disabled=not is_allocation_symmetric()
+                get_tp_group(), disabled=not is_allreduce_allocation_symmetric()
             )
         with symm_ctx:
             output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
