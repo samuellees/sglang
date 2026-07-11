@@ -1031,7 +1031,11 @@ def main(server_args, bench_args):
         for proc in workers:
             proc.join()
 
-        proc.terminate()
+        failed_workers = [
+            (proc.pid, proc.exitcode) for proc in workers if proc.exitcode != 0
+        ]
+        if failed_workers:
+            raise RuntimeError(f"one_batch workers failed: {failed_workers}")
 
 
 def cli_main():
