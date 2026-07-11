@@ -65,6 +65,7 @@ def _get_mega_moe_symm_buffer(
     num_topk: int,
     hidden: int,
     intermediate_hidden: int,
+    mma_type: str,
 ) -> SymmBuffer:
     import deep_gemm
 
@@ -77,6 +78,7 @@ def _get_mega_moe_symm_buffer(
         num_topk,
         hidden,
         intermediate_hidden,
+        mma_type,
     )
     buf = _MEGA_MOE_SYMM_BUFFER.get(key)
     if buf is None:
@@ -87,7 +89,7 @@ def _get_mega_moe_symm_buffer(
             num_topk,
             hidden,
             intermediate_hidden,
-            use_fp8_dispatch=True,
+            mma_type=mma_type,
             activation="swiglu",
         )
         _MEGA_MOE_SYMM_BUFFER[key] = buf
@@ -197,6 +199,8 @@ def _run_mega_routed(
         f"cuda_graph_max_bs / chunked_prefill_size accordingly"
     )
 
+    weight_is_fp8 = moe.experts.mega_l1_weights[0].dtype == torch.float8_e4m3fn
+    mma_type = "fp8xfp8" if weight_is_fp8 else "fp8xfp4"
     buf = _get_mega_moe_symm_buffer(
         ep_group,
         num_experts=num_experts,
@@ -204,6 +208,7 @@ def _run_mega_routed(
         num_topk=top_k,
         hidden=hidden_size,
         intermediate_hidden=intermediate_size,
+        mma_type=mma_type,
     )
 
     if num_tokens > 0:
@@ -250,7 +255,12 @@ def _run_mega_routed(
         device=hidden_states.device,
     )
     swiglu_limit = getattr(moe.config, "swiglu_limit", None)
-    deep_gemm.fp8_fp4_mega_moe(
+    mega_moe_fn = (
+        deep_gemm.fp8_fp8_mega_moe
+        if weight_is_fp8
+        else deep_gemm.fp8_fp4_mega_moe
+    )
+    mega_moe_fn(
         y,
         moe.experts.mega_l1_weights,
         moe.experts.mega_l2_weights,
@@ -308,31 +318,37 @@ def build_mega_moe_experts_weights(experts) -> None:
         return
 
     w13 = experts.w13_weight.data
-    w13_sf_fp32 = experts.w13_weight_scale_inv.data
+    w13_sf_input = experts.w13_weight_scale_inv.data
     w2 = experts.w2_weight.data
-    w2_sf_fp32 = experts.w2_weight_scale_inv.data
+    w2_sf_input = experts.w2_weight_scale_inv.data
 
-    num_groups, n1, half_k1 = w13.shape
-    k1 = half_k1 * 2
-    _, n2, half_k2 = w2.shape
-    k2 = half_k2 * 2
-
-    w13_sf = transform_sf_into_required_layout(
-        w13_sf_fp32,
-        mn=n1,
-        k=k1,
-        recipe=(1, 32),
-        num_groups=num_groups,
-        disable_ue8m0_cast=False,
-    )
-    w2_sf = transform_sf_into_required_layout(
-        w2_sf_fp32,
-        mn=n2,
-        k=k2,
-        recipe=(1, 32),
-        num_groups=num_groups,
-        disable_ue8m0_cast=False,
-    )
+    num_groups, n1, stored_k1 = w13.shape
+    _, n2, stored_k2 = w2.shape
+    weight_is_fp8 = w13.dtype == torch.float8_e4m3fn
+    assert weight_is_fp8 == (w2.dtype == torch.float8_e4m3fn)
+    if weight_is_fp8:
+        assert w13_sf_input.dtype == torch.int32
+        assert w2_sf_input.dtype == torch.int32
+        w13_sf, w2_sf = w13_sf_input, w2_sf_input
+    else:
+        k1 = stored_k1 * 2
+        k2 = stored_k2 * 2
+        w13_sf = transform_sf_into_required_layout(
+            w13_sf_input,
+            mn=n1,
+            k=k1,
+            recipe=(1, 32),
+            num_groups=num_groups,
+            disable_ue8m0_cast=False,
+        )
+        w2_sf = transform_sf_into_required_layout(
+            w2_sf_input,
+            mn=n2,
+            k=k2,
+            recipe=(1, 32),
+            num_groups=num_groups,
+            disable_ue8m0_cast=False,
+        )
 
     if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
         # Build the interleaved L1 weight + scale once; share the weight buffer

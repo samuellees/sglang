@@ -1795,7 +1795,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_q, w2_s = _quantize_and_swizzle_with_cutlass_es_kernel(
                     layer.w2_weight.data
                 )
-            elif get_moe_runner_backend().is_deep_gemm():
+            elif (
+                get_moe_a2a_backend().is_megamoe()
+                or get_moe_runner_backend().is_deep_gemm()
+            ):
                 w13_q, w13_s = _quantize_for_deepgemm(layer.w13_weight.data)
                 w2_q, w2_s = _quantize_for_deepgemm(layer.w2_weight.data)
             elif (
@@ -1828,7 +1831,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_q = layer.w2_weight.data
                 w13_s = layer.w13_weight_scale_inv.data
                 w2_s = layer.w2_weight_scale_inv.data
-            elif get_moe_runner_backend().is_deep_gemm():
+            elif (
+                get_moe_a2a_backend().is_megamoe()
+                or get_moe_runner_backend().is_deep_gemm()
+            ):
                 w13_q = layer.w13_weight.data
                 w2_q = layer.w2_weight.data
                 w13_s = _convert_ue8m0_scales_for_deepgemm(
@@ -1870,6 +1876,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer.w2_weight_scale_inv.format_ue8m0 = True
         layer.w13_input_scale = None
         layer.w2_input_scale = None
+
+        if get_moe_a2a_backend().is_megamoe():
+            from sglang.srt.layers.moe.mega_moe import (
+                build_mega_moe_experts_weights,
+            )
+
+            build_mega_moe_experts_weights(layer)
+            return
 
         if (
             get_moe_runner_backend().is_flashinfer_trtllm()
