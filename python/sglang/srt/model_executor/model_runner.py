@@ -2311,7 +2311,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     if model_type == "qwen3_5_moe_text"
                     else Qwen3_5TextConfig
                 )
-                compat_config = config_cls(**config.to_dict())
+                read_only_properties = {
+                    name
+                    for cls in config_cls.__mro__
+                    for name, descriptor in vars(cls).items()
+                    if isinstance(descriptor, property) and descriptor.fset is None
+                }
+                compat_kwargs = {
+                    name: value
+                    for name, value in config.to_dict().items()
+                    if name not in read_only_properties
+                }
+                compat_config = config_cls(**compat_kwargs)
                 self._qwen3_5_gdn_compat_config = compat_config
             return compat_config
         return None
