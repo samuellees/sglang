@@ -327,11 +327,13 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
         model_runner.init_attention_backends()
         model_runner.init_cuda_graphs()
     rank_print(f"max_total_num_tokens={model_runner.max_total_num_tokens}")
-    tokenizer = get_tokenizer(
-        server_args.tokenizer_path,
-        tokenizer_mode=server_args.tokenizer_mode,
-        trust_remote_code=server_args.trust_remote_code,
-    )
+    tokenizer = None
+    if not server_args.skip_tokenizer_init:
+        tokenizer = get_tokenizer(
+            server_args.tokenizer_path,
+            tokenizer_mode=server_args.tokenizer_mode,
+            trust_remote_code=server_args.trust_remote_code,
+        )
     if server_args.tp_size > 1:
         dist.barrier()
 
@@ -344,6 +346,7 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
 
 
 def prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts):
+    assert tokenizer is not None, "Correctness mode requires tokenizer initialization"
     if custom_prompts:
         custom_input_len = len(custom_prompts)
         bs = bench_args.batch_size[0]
