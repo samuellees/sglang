@@ -49,6 +49,7 @@ from sglang.srt.layers.elementwise import fused_sigmoid_mul
 
 # Layers - Others
 from sglang.srt.layers.layernorm import GemmaRMSNorm
+from sglang.srt.layers.logits_processor import LogitsProcessor
 
 # Layers - Linear
 from sglang.srt.layers.linear import (
@@ -67,7 +68,10 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
-from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -1425,7 +1429,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         )
 
 
-class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
+class Qwen3_5MoeModel(Qwen3_5ForCausalLM):
     def __init__(
         self,
         config: Qwen3_5TextConfig,
@@ -1635,6 +1639,116 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         return loaded_params
 
 
+class Qwen3_5MoeForCausalLM(nn.Module):
+    """Text-only Qwen3.5 MoE wrapper with the standard SGLang logits contract."""
+
+    fall_back_to_pt_during_load = False
+    packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
+    supported_lora_modules = Qwen3_5ForCausalLM.supported_lora_modules
+
+    def __init__(
+        self,
+        config: Qwen3_5TextConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.pp_group = get_pp_group()
+        self.config = config
+        self.quant_config = quant_config
+        self.model = Qwen3_5MoeModel(
+            config=config,
+            quant_config=quant_config,
+            prefix=add_prefix("model", prefix),
+        )
+        if self.pp_group.is_last_rank:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("lm_head", prefix),
+                use_attn_tp_group=get_server_args().enable_dp_lm_head,
+            )
+        else:
+            self.lm_head = PPMissingLayer()
+        self.logits_processor = LogitsProcessor(config)
+        self.capture_aux_hidden_states = False
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ):
+        hidden_states = self.model(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+        if not self.pp_group.is_last_rank:
+            return hidden_states
+
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+        return self.logits_processor(
+            input_ids,
+            hidden_states,
+            self.lm_head,
+            forward_batch,
+            aux_hidden_states,
+        )
+
+    @property
+    def start_layer(self):
+        return self.model.start_layer
+
+    @property
+    def end_layer(self):
+        return self.model.end_layer
+
+    def get_embed_and_head(self):
+        embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
+        head = self.lm_head.weight if self.pp_group.is_last_rank else None
+        return embed, head
+
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]):
+        self.capture_aux_hidden_states = True
+        self.model.set_dflash_layers_to_capture([layer_id + 1 for layer_id in layer_ids])
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        model_weights = []
+        loaded_params = set()
+        lm_head_param = (
+            self.lm_head.weight if self.pp_group.is_last_rank else None
+        )
+        for name, loaded_weight in weights:
+            if name == "lm_head.weight" and lm_head_param is not None:
+                weight_loader = getattr(
+                    lm_head_param, "weight_loader", default_weight_loader
+                )
+                weight_loader(lm_head_param, loaded_weight)
+                loaded_params.add(name)
+                continue
+            if name.startswith("model."):
+                name = name[len("model.") :]
+            model_weights.append((name, loaded_weight))
+        loaded_params.update(self.model.load_weights(model_weights))
+        return loaded_params
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return Qwen3_5MoeModel.get_model_config_for_expert_location(config)
+
+
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
@@ -1804,7 +1918,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         config: Qwen3_5MoeConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        language_model_cls=Qwen3_5MoeForCausalLM,
+        language_model_cls=Qwen3_5MoeModel,
     ) -> None:
         super().__init__(config, quant_config, prefix, language_model_cls)
         rope_config = getattr(self.config, "rope_parameters", None) or getattr(

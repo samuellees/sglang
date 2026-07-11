@@ -1764,6 +1764,25 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             return _pack_moe_scale_for_deepgemm(scale_fp32)
 
+        def _quantize_for_megamoe(weight: torch.Tensor):
+            weight = weight.contiguous()
+            _, _, k = weight.shape
+            assert k % 32 == 0, f"{k=} must be divisible by 32 for MXFP8"
+            qweight, scale_u8 = mxfp8_group_quantize(
+                weight.view(-1, k).contiguous()
+            )
+            qweight = qweight.view_as(weight)
+            triton_scale = scale_u8.view(
+                weight.shape[0], weight.shape[1], k // 32
+            )
+            deepgemm_scale = _convert_ue8m0_scales_for_deepgemm(
+                scale_u8, weight.shape
+            )
+            return qweight, triton_scale, deepgemm_scale
+
+        mega_w13_s = None
+        mega_w2_s = None
+
         if quantize:
             if _is_hip:
                 w13_q, w13_s_u8 = mxfp8_group_quantize(
@@ -1795,10 +1814,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_q, w2_s = _quantize_and_swizzle_with_cutlass_es_kernel(
                     layer.w2_weight.data
                 )
-            elif (
-                get_moe_a2a_backend().is_megamoe()
-                or get_moe_runner_backend().is_deep_gemm()
-            ):
+            elif get_moe_a2a_backend().is_megamoe():
+                w13_q, w13_s, mega_w13_s = _quantize_for_megamoe(
+                    layer.w13_weight.data
+                )
+                w2_q, w2_s, mega_w2_s = _quantize_for_megamoe(
+                    layer.w2_weight.data
+                )
+            elif get_moe_runner_backend().is_deep_gemm():
                 w13_q, w13_s = _quantize_for_deepgemm(layer.w13_weight.data)
                 w2_q, w2_s = _quantize_for_deepgemm(layer.w2_weight.data)
             elif (
@@ -1831,10 +1854,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_q = layer.w2_weight.data
                 w13_s = layer.w13_weight_scale_inv.data
                 w2_s = layer.w2_weight_scale_inv.data
-            elif (
-                get_moe_a2a_backend().is_megamoe()
-                or get_moe_runner_backend().is_deep_gemm()
-            ):
+            elif get_moe_a2a_backend().is_megamoe():
+                w13_q = layer.w13_weight.data
+                w2_q = layer.w2_weight.data
+                mega_w13_s = _convert_ue8m0_scales_for_deepgemm(
+                    layer.w13_weight_scale_inv.data, layer.w13_weight.data.shape
+                )
+                mega_w2_s = _convert_ue8m0_scales_for_deepgemm(
+                    layer.w2_weight_scale_inv.data, layer.w2_weight.data.shape
+                )
+                w13_s = layer.w13_weight_scale_inv.data
+                w2_s = layer.w2_weight_scale_inv.data
+            elif get_moe_runner_backend().is_deep_gemm():
                 w13_q = layer.w13_weight.data
                 w2_q = layer.w2_weight.data
                 w13_s = _convert_ue8m0_scales_for_deepgemm(
@@ -1882,7 +1913,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 build_mega_moe_experts_weights,
             )
 
-            build_mega_moe_experts_weights(layer)
+            assert mega_w13_s is not None and mega_w2_s is not None
+            build_mega_moe_experts_weights(layer, mega_w13_s, mega_w2_s)
             return
 
         if (

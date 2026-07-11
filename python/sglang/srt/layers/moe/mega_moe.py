@@ -315,7 +315,11 @@ def _transpose_mega_moe_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:
     return torch.empty_like(sf).copy_(result)
 
 
-def build_mega_moe_experts_weights(experts) -> None:
+def build_mega_moe_experts_weights(
+    experts,
+    w13_sf_for_deepgemm: Optional[torch.Tensor] = None,
+    w2_sf_for_deepgemm: Optional[torch.Tensor] = None,
+) -> None:
     from deep_gemm import (
         transform_sf_into_required_layout,
         transform_weights_for_mega_moe,
@@ -325,9 +329,17 @@ def build_mega_moe_experts_weights(experts) -> None:
         return
 
     w13 = experts.w13_weight.data
-    w13_sf_input = experts.w13_weight_scale_inv.data
+    w13_sf_input = (
+        experts.w13_weight_scale_inv.data
+        if w13_sf_for_deepgemm is None
+        else w13_sf_for_deepgemm
+    )
     w2 = experts.w2_weight.data
-    w2_sf_input = experts.w2_weight_scale_inv.data
+    w2_sf_input = (
+        experts.w2_weight_scale_inv.data
+        if w2_sf_for_deepgemm is None
+        else w2_sf_for_deepgemm
+    )
 
     num_groups, n1, stored_k1 = w13.shape
     _, n2, stored_k2 = w2.shape
