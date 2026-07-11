@@ -1443,11 +1443,14 @@ async def benchmark(
     outputs: List[RequestFuncOutput] = []
     fixed_concurrency_waves = getattr(args, "fixed_concurrency_waves", False)
     fixed_wave_interval = getattr(args, "fixed_wave_interval", 0.0)
+    round_robin_routed_dp_size = getattr(args, "round_robin_routed_dp_size", 0)
     wave_pause_s = 0.0
     if fixed_concurrency_waves and not max_concurrency:
         raise ValueError("--fixed-concurrency-waves requires --max-concurrency")
     if fixed_wave_interval < 0:
         raise ValueError("--fixed-wave-interval must be non-negative")
+    if round_robin_routed_dp_size < 0:
+        raise ValueError("--round-robin-routed-dp-size must be non-negative")
     pbar_total = len(input_requests)
     if (
         backend == "sglang" and args.dataset_name == "mooncake"
@@ -1474,6 +1477,7 @@ async def benchmark(
         lora_probs = None
 
     pbar = None if disable_tqdm else tqdm(total=pbar_total)
+    request_idx = 0
     async for request in request_generator:
         if lora_names is not None and len(lora_names) != 0:
             if lora_request_distribution == "uniform":
@@ -1493,6 +1497,11 @@ async def benchmark(
         # Merge global extra_request_body with per-request extras
         # Per-request parameters take precedence over global ones
         merged_extra_body = {**extra_request_body, **request.extra_request_body}
+        if round_robin_routed_dp_size:
+            merged_extra_body["routed_dp_rank"] = (
+                request_idx % round_robin_routed_dp_size
+            )
+        request_idx += 1
 
         request_func_input = RequestFuncInput(
             model=model_id,
@@ -1759,6 +1768,7 @@ async def benchmark(
             "fixed_concurrency_waves": fixed_concurrency_waves,
             "fixed_wave_interval": fixed_wave_interval,
             "fixed_wave_initial_delay": fixed_wave_initial_delay,
+            "round_robin_routed_dp_size": round_robin_routed_dp_size,
             "sharegpt_output_len": args.sharegpt_output_len,
             "random_input_len": args.random_input_len,
             "random_output_len": args.random_output_len,
@@ -2370,6 +2380,13 @@ def cli_main():
         default=0.0,
         help="Delay in seconds after readiness/warmup so all DP workers can report "
         "active before the first fixed wave; outside benchmark timing.",
+    )
+    parser.add_argument(
+        "--round-robin-routed-dp-size",
+        type=int,
+        default=0,
+        help="Set routed_dp_rank=request_index %% size for deterministic direct "
+        "DP placement; 0 leaves placement to the server controller.",
     )
     parser.add_argument("--output-file", type=str, help="Output JSONL file name.")
     parser.add_argument(
