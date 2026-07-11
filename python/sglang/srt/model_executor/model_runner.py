@@ -2298,6 +2298,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             | JetVLMConfig,
         ):
             return config
+        # Recent transformers releases provide native Qwen3.5 text config
+        # classes, which are not subclasses of SGLang's compatibility configs.
+        # The text model types still unambiguously select the GDN backend.
+        if getattr(config, "model_type", None) in {
+            "qwen3_5_text",
+            "qwen3_5_moe_text",
+        }:
+            return config
         return None
 
     @property
