@@ -198,6 +198,7 @@ class BenchArgs:
     output_len: Tuple[int] = (16,)
     prompt_filename: str = ""
     result_filename: str = "result.jsonl"
+    warmup_each_shape: bool = False
     correctness_test: bool = False
     # This is only used for correctness test
     cut_len: int = 4
@@ -227,6 +228,11 @@ class BenchArgs:
         )
         parser.add_argument(
             "--result-filename", type=str, default=BenchArgs.result_filename
+        )
+        parser.add_argument(
+            "--warmup-each-shape",
+            action="store_true",
+            help="Warm up every unique batch/input shape before recording the sweep.",
         )
         parser.add_argument("--correctness-test", action="store_true")
         parser.add_argument("--cut-len", type=int, default=BenchArgs.cut_len)
@@ -886,6 +892,32 @@ def latency_test(
         profile_start_step=None,
         profile_steps=None,
     )
+
+    if bench_args.warmup_each_shape:
+        rank_print("Warmup each sweep shape ...")
+        warmup_output_len = min(4, max(bench_args.output_len))
+        for bs, il in dict.fromkeys(
+            itertools.product(bench_args.batch_size, bench_args.input_len)
+        ):
+            reqs = prepare_synthetic_inputs_for_latency_test(bs, il)
+            latency_test_run_once(
+                bench_args.run_name,
+                model_runner,
+                rank_print,
+                reqs,
+                bs,
+                il,
+                warmup_output_len,
+                log_decode_step=0,
+                profile=False,
+                profile_record_shapes=False,
+                profile_activities=("CPU", "GPU"),
+                profile_prefix="",
+                profile_stage="all",
+                tp_rank=tp_rank,
+                profile_start_step=None,
+                profile_steps=None,
+            )
 
     rank_print("Benchmark ...")
 
