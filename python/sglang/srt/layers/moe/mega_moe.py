@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Mega-MoE forward path and expert-weight prep shared by Deepseek V2/V4."""
+"""Mega-MoE forward path and expert-weight prep for supported MoE models."""
 
 from __future__ import annotations
 
@@ -164,8 +164,15 @@ def _run_mega_routed(
     hidden_size = moe.config.hidden_size
 
     if num_tokens > 0:
-        router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
-        topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
+        if hasattr(moe.config, "n_routed_experts"):
+            router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
+        else:
+            router_logits = moe.gate(hidden_states)
+            if isinstance(router_logits, tuple):
+                router_logits = router_logits[0]
+        topk_kwargs = (
+            {"input_ids": input_ids_global} if getattr(moe, "is_hash", False) else {}
+        )
         topk_output = moe.topk(
             hidden_states,
             router_logits,
@@ -272,8 +279,8 @@ def _run_mega_routed(
     )
     y = y[:num_tokens]
 
-    if not moe.experts.should_fuse_routed_scaling_factor_in_topk:
-        y.mul_(moe.routed_scaling_factor)
+    if not getattr(moe.experts, "should_fuse_routed_scaling_factor_in_topk", True):
+        y.mul_(getattr(moe, "routed_scaling_factor", 1.0))
     return y
 
 
