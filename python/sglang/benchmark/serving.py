@@ -1434,6 +1434,10 @@ async def benchmark(
     # Run all requests
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
+    outputs: List[RequestFuncOutput] = []
+    fixed_concurrency_waves = getattr(args, "fixed_concurrency_waves", False)
+    if fixed_concurrency_waves and not max_concurrency:
+        raise ValueError("--fixed-concurrency-waves requires --max-concurrency")
     pbar_total = len(input_requests)
     if (
         backend == "sglang" and args.dataset_name == "mooncake"
@@ -1498,7 +1502,12 @@ async def benchmark(
                 limited_request_func(request_func_input=request_func_input, pbar=pbar)
             )
         )
-    outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+        if fixed_concurrency_waves and len(tasks) == max_concurrency:
+            outputs.extend(await asyncio.gather(*tasks))
+            tasks.clear()
+
+    if tasks:
+        outputs.extend(await asyncio.gather(*tasks))
     if is_multi_turn:
         outputs = [x for output in outputs for x in output]
 
@@ -2325,6 +2334,12 @@ def cli_main():
         "to execute at a time. This means that when used in combination, the "
         "actual request rate may be lower than specified with --request-rate, "
         "if the server is not processing requests fast enough to keep up.",
+    )
+    parser.add_argument(
+        "--fixed-concurrency-waves",
+        action="store_true",
+        help="Submit exactly --max-concurrency requests per wave and wait for the "
+        "entire wave before submitting the next one.",
     )
     parser.add_argument("--output-file", type=str, help="Output JSONL file name.")
     parser.add_argument(
