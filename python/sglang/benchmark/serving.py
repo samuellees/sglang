@@ -1743,6 +1743,7 @@ async def benchmark(
             "dataset_name": args.dataset_name,
             "request_rate": "trace" if use_trace_timestamps else request_rate,
             "max_concurrency": max_concurrency,
+            "fixed_concurrency_waves": fixed_concurrency_waves,
             "sharegpt_output_len": args.sharegpt_output_len,
             "random_input_len": args.random_input_len,
             "random_output_len": args.random_output_len,
