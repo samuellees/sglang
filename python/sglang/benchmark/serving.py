@@ -1402,6 +1402,12 @@ async def benchmark(
             f"Warmup completed with {args.warmup_requests} sequences. Starting main benchmark run..."
         )
 
+    fixed_wave_initial_delay = getattr(args, "fixed_wave_initial_delay", 0.0)
+    if fixed_wave_initial_delay < 0:
+        raise ValueError("--fixed-wave-initial-delay must be non-negative")
+    if fixed_wave_initial_delay:
+        time.sleep(fixed_wave_initial_delay)
+
     # Flush cache
     if ("sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")) or flush_cache:
         requests.post(base_url + "/flush_cache", headers=get_auth_headers())
@@ -1752,6 +1758,7 @@ async def benchmark(
             "max_concurrency": max_concurrency,
             "fixed_concurrency_waves": fixed_concurrency_waves,
             "fixed_wave_interval": fixed_wave_interval,
+            "fixed_wave_initial_delay": fixed_wave_initial_delay,
             "sharegpt_output_len": args.sharegpt_output_len,
             "random_input_len": args.random_input_len,
             "random_output_len": args.random_output_len,
@@ -2356,6 +2363,13 @@ def cli_main():
         default=0.0,
         help="Quiescence interval in seconds after each fixed concurrency wave; "
         "excluded from the reported benchmark duration.",
+    )
+    parser.add_argument(
+        "--fixed-wave-initial-delay",
+        type=float,
+        default=0.0,
+        help="Delay in seconds after readiness/warmup so all DP workers can report "
+        "active before the first fixed wave; outside benchmark timing.",
     )
     parser.add_argument("--output-file", type=str, help="Output JSONL file name.")
     parser.add_argument(
