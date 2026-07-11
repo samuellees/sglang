@@ -357,7 +357,7 @@ def build_mega_moe_experts_weights(experts) -> None:
             disable_ue8m0_cast=False,
         )
 
-    if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
+    if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get() and not weight_is_fp8:
         # Build the interleaved L1 weight + scale once; share the weight buffer
         # between `w13_weight.data` (normal deep-ep path) and `mega_l1_weights[0]`
         # (mega moe path). Mega moe additionally needs a UTCCP-transposed scale;
