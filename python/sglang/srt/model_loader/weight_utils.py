@@ -1523,12 +1523,12 @@ def initialize_dummy_weights(
                 tmp_param = tmp_param.uniform_(low, high, generator=generator).to(dtype)
                 param.data.copy_(tmp_param)
             else:
-                param.uniform_(low, high, generator=generator)
+                param.data.uniform_(low, high, generator=generator)
         elif param.dtype == torch.uint8 and getattr(param, "format_ue8m0", False):
             # Dummy MXFP8 checkpoints have no serialized scale bytes. UE8M0
             # exponent 127 represents a unit scale and keeps the synthetic
             # forward numerically bounded without changing real model loads.
-            param.fill_(127)
+            param.data.fill_(127)
 
 
 def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
