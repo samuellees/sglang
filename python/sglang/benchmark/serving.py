@@ -1436,8 +1436,12 @@ async def benchmark(
     tasks: List[asyncio.Task] = []
     outputs: List[RequestFuncOutput] = []
     fixed_concurrency_waves = getattr(args, "fixed_concurrency_waves", False)
+    fixed_wave_interval = getattr(args, "fixed_wave_interval", 0.0)
+    wave_pause_s = 0.0
     if fixed_concurrency_waves and not max_concurrency:
         raise ValueError("--fixed-concurrency-waves requires --max-concurrency")
+    if fixed_wave_interval < 0:
+        raise ValueError("--fixed-wave-interval must be non-negative")
     pbar_total = len(input_requests)
     if (
         backend == "sglang" and args.dataset_name == "mooncake"
@@ -1505,6 +1509,9 @@ async def benchmark(
         if fixed_concurrency_waves and len(tasks) == max_concurrency:
             outputs.extend(await asyncio.gather(*tasks))
             tasks.clear()
+            if fixed_wave_interval:
+                await asyncio.sleep(fixed_wave_interval)
+                wave_pause_s += fixed_wave_interval
 
     if tasks:
         outputs.extend(await asyncio.gather(*tasks))
@@ -1553,7 +1560,7 @@ async def benchmark(
         accept_length = None
 
     # Compute metrics and print results
-    benchmark_duration = time.perf_counter() - benchmark_start_time
+    benchmark_duration = time.perf_counter() - benchmark_start_time - wave_pause_s
     metrics, output_lens = calculate_metrics(
         input_requests=None if is_multi_turn else input_requests,
         outputs=outputs,
@@ -1744,6 +1751,7 @@ async def benchmark(
             "request_rate": "trace" if use_trace_timestamps else request_rate,
             "max_concurrency": max_concurrency,
             "fixed_concurrency_waves": fixed_concurrency_waves,
+            "fixed_wave_interval": fixed_wave_interval,
             "sharegpt_output_len": args.sharegpt_output_len,
             "random_input_len": args.random_input_len,
             "random_output_len": args.random_output_len,
@@ -2341,6 +2349,13 @@ def cli_main():
         action="store_true",
         help="Submit exactly --max-concurrency requests per wave and wait for the "
         "entire wave before submitting the next one.",
+    )
+    parser.add_argument(
+        "--fixed-wave-interval",
+        type=float,
+        default=0.0,
+        help="Quiescence interval in seconds after each fixed concurrency wave; "
+        "excluded from the reported benchmark duration.",
     )
     parser.add_argument("--output-file", type=str, help="Output JSONL file name.")
     parser.add_argument(
