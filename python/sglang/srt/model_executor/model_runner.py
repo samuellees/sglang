@@ -61,6 +61,7 @@ from sglang.srt.configs.model_config import (
     get_num_indexer_layers,
     is_deepseek_dsa,
 )
+from sglang.srt.configs.qwen3_5 import Qwen3_5MoeTextConfig, Qwen3_5TextConfig
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.debug_utils.dumper import dumper
@@ -2300,12 +2301,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return config
         # Recent transformers releases provide native Qwen3.5 text config
         # classes, which are not subclasses of SGLang's compatibility configs.
-        # The text model types still unambiguously select the GDN backend.
-        if getattr(config, "model_type", None) in {
-            "qwen3_5_text",
-            "qwen3_5_moe_text",
-        }:
-            return config
+        # Adapt them once so GDN cache code also gets SGLang's derived fields.
+        model_type = getattr(config, "model_type", None)
+        if model_type in {"qwen3_5_text", "qwen3_5_moe_text"}:
+            compat_config = getattr(self, "_qwen3_5_gdn_compat_config", None)
+            if compat_config is None:
+                config_cls = (
+                    Qwen3_5MoeTextConfig
+                    if model_type == "qwen3_5_moe_text"
+                    else Qwen3_5TextConfig
+                )
+                compat_config = config_cls(**config.to_dict())
+                self._qwen3_5_gdn_compat_config = compat_config
+            return compat_config
         return None
 
     @property
