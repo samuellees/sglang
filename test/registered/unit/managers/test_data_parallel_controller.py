@@ -12,6 +12,7 @@ is exercised as the real method, no mock.
 """
 
 import unittest
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -27,6 +28,7 @@ from sglang.srt.managers.data_parallel_controller import (
     DPBudget,
     LoadBalanceMethod,
 )
+from sglang.srt.managers.io_struct import BatchTokenizedGenerateReqInput
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -50,6 +52,9 @@ def _make_controller(dp_size: int) -> DataParallelController:
     ctl.status = [True] * dp_size
     ctl.round_robin_counter = 0
     ctl.dp_budget = DPBudget(dp_size=dp_size)
+    ctl.load_balance_method = LoadBalanceMethod.ROUND_ROBIN
+    ctl.coalesce_external_dp_routing = False
+    ctl.external_dp_route_queues = [deque() for _ in range(dp_size)]
     return ctl
 
 
@@ -59,6 +64,8 @@ def _req(routed_dp_rank=None, bootstrap_room=None, input_ids=None):
         routed_dp_rank=routed_dp_rank,
         bootstrap_room=bootstrap_room,
         input_ids=input_ids or [],
+        rid="test-rid",
+        time_stats=None,
     )
 
 
@@ -166,6 +173,19 @@ class TestDPBudgetDispatch(CustomTestCase):
 
 
 class TestRoundRobinScheduler(CustomTestCase):
+    def test_atomic_batch_sends_one_local_batch_per_worker(self):
+        ctl = _make_controller(dp_size=4)
+        reqs = [_req() for _ in range(12)]
+
+        ctl.dispatch_batch_generate(BatchTokenizedGenerateReqInput(batch=reqs))
+
+        for worker in ctl.workers:
+            worker.send_pyobj.assert_called_once()
+            local_batch = worker.send_pyobj.call_args.args[0]
+            self.assertIsInstance(local_batch, BatchTokenizedGenerateReqInput)
+            self.assertEqual(len(local_batch), 3)
+        self.assertEqual(ctl.round_robin_counter, 0)
+
     def test_cycles_through_active_workers_in_order(self):
         ctl = _make_controller(dp_size=4)
         for _ in range(8):
@@ -206,6 +226,42 @@ class TestRoundRobinScheduler(CustomTestCase):
         # Subsequent round-robin req still lands on worker 0
         ctl.round_robin_scheduler(_req())
         ctl.workers[0].send_pyobj.assert_called_once()
+
+    def test_coalesced_routing_waits_for_every_rank(self):
+        ctl = _make_controller(dp_size=4)
+        ctl.coalesce_external_dp_routing = True
+
+        reqs = [_req(routed_dp_rank=rank) for rank in range(4)]
+        for req in reqs[:-1]:
+            ctl.round_robin_scheduler(req)
+        for worker in ctl.workers:
+            worker.send_pyobj.assert_not_called()
+
+        ctl.round_robin_scheduler(reqs[-1])
+        for rank, worker in enumerate(ctl.workers):
+            calls = [call.args[0] for call in worker.send_pyobj.call_args_list]
+            self.assertEqual(len(calls), 1)
+            self.assertIs(calls[0], reqs[rank])
+
+    def test_coalesced_routing_flushes_multiple_epochs(self):
+        ctl = _make_controller(dp_size=2)
+        ctl.coalesce_external_dp_routing = True
+
+        rank0_reqs = [_req(routed_dp_rank=0) for _ in range(2)]
+        rank1_reqs = [_req(routed_dp_rank=1) for _ in range(2)]
+        ctl.round_robin_scheduler(rank0_reqs[0])
+        ctl.round_robin_scheduler(rank0_reqs[1])
+        ctl.round_robin_scheduler(rank1_reqs[0])
+        ctl.round_robin_scheduler(rank1_reqs[1])
+
+        self.assertEqual(
+            [call.args[0] for call in ctl.workers[0].send_pyobj.call_args_list],
+            rank0_reqs,
+        )
+        self.assertEqual(
+            [call.args[0] for call in ctl.workers[1].send_pyobj.call_args_list],
+            rank1_reqs,
+        )
 
 
 class TestFollowBootstrapRoomScheduler(CustomTestCase):

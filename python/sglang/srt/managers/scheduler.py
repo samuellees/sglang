@@ -906,6 +906,20 @@ class Scheduler(
         self.attn_cp_cpu_group = self.attn_cp_group.cpu_group
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
+        self.dp_atomic_admission_group = None
+        if self.server_args.synchronize_dp_atomic_batches:
+            if (
+                self.server_args.tp_size != self.server_args.dp_size
+                or self.ps.attn_tp_size != 1
+            ):
+                raise ValueError(
+                    "--synchronize-dp-atomic-batches requires tp_size == dp_size "
+                    "and one attention rank per DP rank"
+                )
+            self.dp_atomic_admission_group = torch.distributed.new_group(
+                ranks=self.tp_group.ranks,
+                backend="gloo",
+            )
 
         # NOTE: dp_tp_* are request/data-plane coordination groups (not tensor collectives).
         # When DP attention is enabled, scope to the attention-TP group; otherwise use
@@ -1760,6 +1774,7 @@ class Scheduler(
             ps=self.ps,
             tp_group=self.tp_group,
             tp_cpu_group=self.tp_cpu_group,
+            dp_atomic_admission_group=self.dp_atomic_admission_group,
             attn_tp_group=self.attn_tp_group,
             attn_tp_cpu_group=self.attn_tp_cpu_group,
             attn_cp_group=self.attn_cp_group,

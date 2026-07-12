@@ -1566,7 +1566,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         generators = []
         rids = []
         if getattr(obj, "parallel_sample_num", 1) == 1:
-            if self._should_use_batch_tokenization(batch_size, obj):
+            use_pretokenized_dp_batch = (
+                self.server_args.enable_dp_attention
+                and not self._batch_has_text(batch_size, obj)
+                and all(obj[i].input_ids is not None for i in range(batch_size))
+            )
+            if use_pretokenized_dp_batch:
+                tokenized_objs = [
+                    await self._tokenize_one_request(obj[i]) for i in range(batch_size)
+                ]
+                self._send_batch_request(tokenized_objs)
+
+                for i in range(batch_size):
+                    tmp_obj = obj[i]
+                    state = self.rid_to_state[tmp_obj.rid]
+                    if tmp_obj.return_prompt_token_ids:
+                        state.prompt_token_ids = list(tokenized_objs[i].input_ids)
+                    generators.append(self._wait_one_response(tmp_obj, request))
+                    rids.append(tmp_obj.rid)
+            elif self._should_use_batch_tokenization(batch_size, obj):
                 tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
                 self._send_batch_request(tokenized_objs)
 

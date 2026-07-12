@@ -951,6 +951,14 @@ class ServerArgs:
         bool,
         "With DP-attention, send control messages to every DP group leader and broadcast within attn_tp_group instead of the full tp_group. Eliminates a costly all-ranks gloo sync on every scheduler iteration.",
     ] = False
+    coalesce_dp_routed_requests: A[
+        bool,
+        "Coalesce explicitly routed DP requests into complete DP epochs and synchronize scheduler admission once per epoch. Requires one attention rank per DP rank.",
+    ] = False
+    synchronize_dp_atomic_batches: A[
+        bool,
+        "Synchronize batched DP-attention work on a dedicated Gloo process group before scheduler admission. Requires tp_size == dp_size and one attention rank per DP rank.",
+    ] = False
     enable_dp_lm_head: A[
         bool,
         Arg(

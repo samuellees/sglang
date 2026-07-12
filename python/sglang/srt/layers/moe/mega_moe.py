@@ -196,14 +196,27 @@ def _run_mega_routed(
     num_experts = moe.experts.num_experts
     top_k = moe.config.num_experts_per_tok + moe.num_fused_shared_experts
     intermediate_size = moe.config.moe_intermediate_size
-    num_max_tokens_per_rank = (
+    configured_max_tokens_per_rank = (
         envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
     )
-    assert num_tokens <= num_max_tokens_per_rank, (
-        f"mega MoE: num_tokens={num_tokens} exceeds cap "
+    global_num_tokens = get_dp_global_num_tokens()
+    max_tokens_per_rank = (
+        max(global_num_tokens) if global_num_tokens else num_tokens
+    )
+    assert max_tokens_per_rank <= configured_max_tokens_per_rank, (
+        f"mega MoE: local_num_tokens={num_tokens}, "
+        f"max_tokens_per_rank={max_tokens_per_rank} exceeds cap "
         f"SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
-        f"{num_max_tokens_per_rank}; raise the env var or shrink "
+        f"{configured_max_tokens_per_rank}; raise the env var or shrink "
         f"cuda_graph_max_bs / chunked_prefill_size accordingly"
+    )
+    # Keep decode on the tuned 128-token workspace while allowing the default
+    # 256-token chunked-prefill batch. The DP-global maximum makes every rank
+    # select the same symmetric-buffer capacity even with uneven local work.
+    num_max_tokens_per_rank = (
+        min(configured_max_tokens_per_rank, 128)
+        if max_tokens_per_rank <= 128
+        else configured_max_tokens_per_rank
     )
 
     weight_is_fp8 = moe.experts.mega_l1_weights[0].dtype == torch.float8_e4m3fn

@@ -16,9 +16,11 @@
 import faulthandler
 import logging
 import multiprocessing as mp
+import os
 import signal
 import threading
 import time
+from collections import deque
 from enum import Enum, auto
 from typing import Callable, List, Optional
 
@@ -180,6 +182,21 @@ class DataParallelController:
         self.scheduler_procs = []
         self.workers: List[zmq.Socket] = [None] * server_args.dp_size
         self.status: List[bool] = [True] * server_args.dp_size
+        self.coalesce_external_dp_routing = (
+            server_args.coalesce_dp_routed_requests
+            or os.getenv("SGLANG_COALESCE_DP_ROUTED_REQUESTS", "0") == "1"
+        )
+        if (
+            self.coalesce_external_dp_routing
+            and server_args.tp_size != server_args.dp_size
+        ):
+            raise ValueError(
+                "SGLANG_COALESCE_DP_ROUTED_REQUESTS currently requires "
+                "one attention rank per DP rank (tp_size == dp_size)"
+            )
+        self.external_dp_route_queues = [
+            deque() for _ in range(server_args.dp_size)
+        ]
 
         if server_args.enable_dp_attention:
             self.launch_dp_attention_schedulers(server_args, port_args)
@@ -251,6 +268,52 @@ class DataParallelController:
         req.time_stats.set_dp_dispatch_finish_time()
 
     def dispatch_batch_generate(self, batch_req: BatchTokenizedGenerateReqInput):
+        if self.load_balance_method == LoadBalanceMethod.ROUND_ROBIN and all(
+            req.routed_dp_rank is None for req in batch_req
+        ):
+            worker_batches = [[] for _ in self.workers]
+            original_time_stats = []
+            for req in batch_req:
+                time_stats = DPControllerReqTimeStats.new_from_obj(
+                    unwrap_from_pickle(req.time_stats)
+                )
+                time_stats.set_dp_dispatch_time()
+                original_time_stats.append(time_stats)
+                req.time_stats = wrap_as_pickle(time_stats)
+
+                while not self.status[self.round_robin_counter]:
+                    self.round_robin_counter = (
+                        self.round_robin_counter + 1
+                    ) % len(self.workers)
+                worker_batches[self.round_robin_counter].append(req)
+                self.round_robin_counter = (
+                    self.round_robin_counter + 1
+                ) % len(self.workers)
+
+            if os.getenv("SGLANG_DEBUG_DP_ROUTING", "0") == "1":
+                batch_sizes = [len(worker_batch) for worker_batch in worker_batches]
+                logger.info(
+                    "DP_ATOMIC_DISPATCH ranks=%s local_batch_min=%s "
+                    "local_batch_max=%s total=%s",
+                    len(self.workers),
+                    min(batch_sizes),
+                    max(batch_sizes),
+                    sum(batch_sizes),
+                )
+
+            send_order = list(range(1, len(self.workers))) + [0]
+            for rank in send_order:
+                if worker_batches[rank]:
+                    sock_send(
+                        self.workers[rank],
+                        BatchTokenizedGenerateReqInput(batch=worker_batches[rank]),
+                    )
+
+            for req, time_stats in zip(batch_req, original_time_stats):
+                req.time_stats = time_stats
+                req.time_stats.set_dp_dispatch_finish_time()
+            return
+
         if self.refresh_load_budget_on_dispatch:
             self.refresh_load_budget()
         for req in batch_req:
@@ -604,8 +667,32 @@ class DataParallelController:
 
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.routed_dp_rank is not None:
+            if os.getenv("SGLANG_DEBUG_DP_ROUTING", "0") == "1":
+                logger.info(
+                    "DP_ROUTE_DISPATCH rid=%s target_dp_rank=%s",
+                    req.rid,
+                    req.routed_dp_rank,
+                )
             logger.debug(f"Direct routing to DP rank {req.routed_dp_rank}")
-            sock_send(self.workers[req.routed_dp_rank], req)
+            if self.coalesce_external_dp_routing:
+                self.external_dp_route_queues[req.routed_dp_rank].append(req)
+                while all(self.external_dp_route_queues):
+                    # Queue rank 0 last. Its scheduler is colocated with the
+                    # controller and otherwise can observe the wave before the
+                    # remote scheduler queues have been populated.
+                    send_order = list(range(1, len(self.workers))) + [0]
+                    for rank in send_order:
+                        sock_send(
+                            self.workers[rank],
+                            self.external_dp_route_queues[rank].popleft(),
+                        )
+                    if os.getenv("SGLANG_DEBUG_DP_ROUTING", "0") == "1":
+                        logger.info(
+                            "DP_ROUTE_FLUSH ranks=%s",
+                            len(self.workers),
+                        )
+            else:
+                sock_send(self.workers[req.routed_dp_rank], req)
             return True
         return False
 

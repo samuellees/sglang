@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import logging
+import os
+import time
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
@@ -12,7 +15,7 @@ from typing import (
 )
 
 import zmq
-from torch.distributed import barrier
+import torch
 
 from sglang.srt.disaggregation.utils import prepare_abort
 from sglang.srt.managers.io_struct import (
@@ -42,6 +45,8 @@ if TYPE_CHECKING:
     )
 
 
+logger = logging.getLogger(__name__)
+
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerRequestReceiver:
     recv_from_tokenizer: Union[zmq.Socket, ScriptedTokenizerRecvProxy]
@@ -52,6 +57,7 @@ class SchedulerRequestReceiver:
     ps: ParallelState
     tp_group: Any
     tp_cpu_group: Any
+    dp_atomic_admission_group: Any
     attn_tp_group: Any
     attn_tp_cpu_group: Any
     attn_cp_group: Any
@@ -84,6 +90,29 @@ class SchedulerRequestReceiver:
 
         recv_reqs = self._pull_raw_reqs()
 
+        if self.dp_atomic_admission_group is not None:
+            recv_reqs = self._synchronize_atomic_batch(recv_reqs)
+
+        if recv_reqs and os.getenv("SGLANG_DEBUG_DP_ROUTING", "0") == "1":
+            work_count = sum(
+                isinstance(
+                    req,
+                    (
+                        TokenizedGenerateReqInput,
+                        BatchTokenizedGenerateReqInput,
+                        TokenizedEmbeddingReqInput,
+                        BatchTokenizedEmbeddingReqInput,
+                    ),
+                )
+                for req in recv_reqs
+            )
+            logger.info(
+                "DP_ROUTE_RECEIVE dp_rank=%s total=%s work=%s",
+                self.ps.attn_dp_rank,
+                len(recv_reqs),
+                work_count,
+            )
+
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
 
@@ -97,6 +126,56 @@ class SchedulerRequestReceiver:
         self._finalize_shm_features(recv_reqs)
 
         return recv_reqs
+
+    def _synchronize_atomic_batch(self, recv_reqs: Optional[List]) -> List:
+        recv_reqs = recv_reqs or []
+        world_size = torch.distributed.get_world_size(
+            self.dp_atomic_admission_group
+        )
+        logged_begin = False
+        while True:
+            has_atomic_batch = any(
+                isinstance(
+                    req,
+                    (
+                        BatchTokenizedGenerateReqInput,
+                        BatchTokenizedEmbeddingReqInput,
+                    ),
+                )
+                for req in recv_reqs
+            )
+            ready_count = torch.tensor([int(has_atomic_batch)], dtype=torch.int32)
+            torch.distributed.all_reduce(
+                ready_count,
+                op=torch.distributed.ReduceOp.SUM,
+                group=self.dp_atomic_admission_group,
+            )
+            ready_count = int(ready_count.item())
+            if ready_count == 0:
+                return recv_reqs
+            if not logged_begin and os.getenv("SGLANG_DEBUG_DP_ROUTING", "0") == "1":
+                logger.info(
+                    "DP_ATOMIC_ADMISSION_BEGIN dp_rank=%s ready=%s/%s",
+                    self.ps.attn_dp_rank,
+                    ready_count,
+                    world_size,
+                )
+                logged_begin = True
+            if ready_count == world_size:
+                if os.getenv("SGLANG_DEBUG_DP_ROUTING", "0") == "1":
+                    logger.info(
+                        "DP_ATOMIC_ADMISSION_END dp_rank=%s ready=%s/%s",
+                        self.ps.attn_dp_rank,
+                        ready_count,
+                        world_size,
+                    )
+                return recv_reqs
+
+            more_reqs = self._pull_raw_reqs()
+            if more_reqs:
+                recv_reqs.extend(more_reqs)
+            else:
+                time.sleep(0.001)
 
     def _pull_raw_reqs(self) -> Optional[List]:
         if self.ps.pp_rank == 0:
