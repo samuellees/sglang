@@ -352,6 +352,12 @@ def dispatch_custom_allreduce(
     Note: ``ServerArgs._handle_environment_variables`` forces this env to "0" when
     ``nnodes > 1`` since custom AR is intra-node only.
     """
+    if _is_cuda and envs.SGLANG_USE_PCIE_CUSTOM_ALL_REDUCE.get():
+        from .pcie_custom_all_reduce import PcieCustomAllReduce
+
+        logger.info("[AR] Using PCIe custom allreduce")
+        return PcieCustomAllReduce
+
     if _is_cuda and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
         from .custom_all_reduce_v2 import (
             CustomAllReduceV2,

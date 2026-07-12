@@ -1,0 +1,260 @@
+{
+  "schema_version": 1,
+  "profile_name": "SM120_5KPRO-tp2-h2048-bf16",
+  "rows": [
+    {
+      "tp": 2,
+      "hidden": 2048,
+      "dtype": "bf16",
+      "batch": 1,
+      "algorithm": "custom_ipc_v2_remote_push",
+      "blocks": 32,
+      "threads": 64,
+      "vec_packs": 1,
+      "comment": "heuristic_seed"
+    },
+    {
+      "tp": 2,
+      "hidden": 2048,
+      "dtype": "bf16",
+      "batch": 2,
+      "algorithm": "custom_ipc_v2_remote_push",
+      "blocks": 128,
+      "threads": 64,
+      "vec_packs": 1,
+      "comment": "heuristic_seed"
+    },
+    {
+      "tp": 2,
+      "hidden": 2048,
+      "dtype": "bf16",
+      "batch": 4,
+      "algorithm": "custom_ipc_v2_remote_push_stream",
+      "blocks": 64,
+      "threads": 128,
+      "vec_packs": 1,
+      "comment": "heuristic_seed"
+    },
+    {
+      "tp": 2,
+      "hidden": 2048,
+      "dtype": "bf16",
+      "batch": 8,
+      "algorithm": "custom_ipc_v2_remote_push_stream",
+      "blocks": 96,
+      "threads": 64,
+      "vec_packs": 1,
+      "comment": "heuristic_seed"
+    },
+    {
+      "tp": 2,
+      "hidden": 2048,
+      "dtype": "bf16",
+      "batch": 12,
+      "algorithm": "custom_ipc_v2_remote_push",
+      "blocks": 16,
+      "threads": 64,
+      "vec_packs": 1,
+      "comment": "heuristic_seed"
+    },
+    {
+      "tp": 2,
+      "hidden": 2048,
+      "dtype": "bf16",
+      "batch": 14,
+      "algorithm": "custom_ipc_v2_remote_push",
+      "blocks": 32,
+      "threads": 128,
+      "vec_packs": 1,
+      "comment": "heuristic_seed_cc14"
+    },
+    {
+      "tp": 2,
+      "hidden": 2048,
+      "dtype": "bf16",
+      "batch": 16,
+      "algorithm": "custom_ipc_v2_remote_push",
+      "blocks": 64,
+      "threads": 128,
+      "vec_packs": 1,
+      "comment": "heuristic_seed"
+    },
+    {
+      "tp": 2,
+      "hidden": 2048,
+      "dtype": "bf16",
+      "batch": 20,
+      "algorithm": "custom_ipc_v2_remote_push",
+      "blocks": 16,
+      "threads": 64,
+      "vec_packs": 1,
+      "comment": "heuristic_seed"
+    },
+    {
+      "tp": 2,
+      "hidden": 2048,
+      "dtype": "bf16",
+      "batch": 24,
+      "algorithm": "custom_ipc_v2_remote_push",
+      "blocks": 16,
+      "threads": 64,
+      "vec_packs": 1,
+      "comment": "heuristic_seed"
+    },
+    {
+      "tp": 2,
+      "hidden": 2048,
+      "dtype": "bf16",
+      "batch": 28,
+      "algorithm": "custom_ipc_v2_remote_push",
+      "blocks": 16,
+      "threads": 64,
+      "vec_packs": 1,
+      "comment": "heuristic_seed"
+    },
+    {
+      "tp": 2,
+      "hidden": 2048,
+      "dtype": "bf16",
+      "batch": 32,
+      "algorithm": "custom_ipc_v2_remote_push_stream",
+      "blocks": 64,
+      "threads": 64,
+      "vec_packs": 1,
+      "comment": "heuristic_seed"
+    },
+    {
+      "tp": 2,
+      "hidden": 2048,
+      "dtype": "bf16",
+      "batch": 36,
+      "algorithm": "custom_ipc_v2_remote_push",
+      "blocks": 16,
+      "threads": 128,
+      "vec_packs": 1,
+      "comment": "heuristic_seed"
+    },
+    {
+      "tp": 2,
+      "hidden": 2048,
+      "dtype": "bf16",
+      "batch": 40,
+      "algorithm": "custom_ipc_v2_remote_push",
+      "blocks": 16,
+      "threads": 128,
+      "vec_packs": 1,
+      "comment": "heuristic_seed"
+    },
+    {
+      "tp": 2,
+      "hidden": 2048,
+      "dtype": "bf16",
+      "batch": 44,
+      "algorithm": "custom_ipc_v2_remote_push",
+      "blocks": 16,
+      "threads": 128,
+      "vec_packs": 1,
+      "comment": "heuristic_seed"
+    },
+    {
+      "tp": 2,
+      "hidden": 2048,
+      "dtype": "bf16",
+      "batch": 48,
+      "algorithm": "custom_ipc_v2_remote_push_stream",
+      "blocks": 32,
+      "threads": 128,
+      "vec_packs": 1,
+      "comment": "heuristic_seed"
+    },
+    {
+      "tp": 2,
+      "hidden": 2048,
+      "dtype": "bf16",
+      "batch": 52,
+      "algorithm": "custom_ipc_v2_remote_push",
+      "blocks": 16,
+      "threads": 128,
+      "vec_packs": 1,
+      "comment": "heuristic_seed"
+    },
+    {
+      "tp": 2,
+      "hidden": 2048,
+      "dtype": "bf16",
+      "batch": 56,
+      "algorithm": "custom_ipc_v2_remote_push",
+      "blocks": 16,
+      "threads": 128,
+      "vec_packs": 1,
+      "comment": "heuristic_seed"
+    },
+    {
+      "tp": 2,
+      "hidden": 2048,
+      "dtype": "bf16",
+      "batch": 60,
+      "algorithm": "custom_ipc_v2_remote_push",
+      "blocks": 16,
+      "threads": 128,
+      "vec_packs": 1,
+      "comment": "heuristic_seed"
+    },
+    {
+      "tp": 2,
+      "hidden": 2048,
+      "dtype": "bf16",
+      "batch": 64,
+      "algorithm": "custom_ipc_v2_remote_push",
+      "blocks": 16,
+      "threads": 128,
+      "vec_packs": 1,
+      "comment": "heuristic_seed"
+    },
+    {
+      "tp": 2,
+      "hidden": 2048,
+      "dtype": "bf16",
+      "batch": 96,
+      "algorithm": "custom_ipc_v2_remote_push",
+      "blocks": 16,
+      "threads": 128,
+      "vec_packs": 1,
+      "comment": "cc96_probe_20260711"
+    },
+    {
+      "tp": 2,
+      "hidden": 2048,
+      "dtype": "bf16",
+      "batch": 128,
+      "algorithm": "custom_ipc_v2_remote_push",
+      "blocks": 16,
+      "threads": 128,
+      "vec_packs": 1,
+      "comment": "heuristic_seed"
+    },
+    {
+      "tp": 2,
+      "hidden": 2048,
+      "dtype": "bf16",
+      "batch": 256,
+      "algorithm": "custom_ipc_v2_remote_push",
+      "blocks": 16,
+      "threads": 128,
+      "vec_packs": 1,
+      "comment": "heuristic_seed"
+    },
+    {
+      "tp": 2,
+      "hidden": 2048,
+      "dtype": "bf16",
+      "batch": 512,
+      "algorithm": "custom_ipc_v2_remote_push",
+      "blocks": 16,
+      "threads": 128,
+      "vec_packs": 1,
+      "comment": "heuristic_seed"
+    }
+  ],
+  "fallback": "nccl"
+}
