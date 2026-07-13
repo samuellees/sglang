@@ -1,0 +1,105 @@
+---
+title: "MegaMoE MXFP8 integration"
+description: "Install, enable, validate, troubleshoot, and roll back the MegaMoE MXFP8 backend in SGLang."
+---
+
+MegaMoE is an SGLang MoE backend that combines expert dispatch, expert computation, and result combination in an integrated DeepGEMM execution path. The MXFP8 path consumes compatible quantized expert weights and prepares the runtime views required by the fused kernel during model loading.
+
+This page intentionally omits deployment-specific model dimensions, expert configuration, parallel group sizes, batch sizes, and performance tuning values. Keep those settings in the customer's approved model and deployment configuration.
+
+## Prerequisites
+
+Before enabling the backend, confirm that your environment has:
+
+- A supported NVIDIA CUDA platform with the required device interconnect and symmetric-memory support.
+- SGLang from the `integration/megamoe-mxfp8` branch.
+- DeepGEMM from the matching `integration/megamoe-mxfp8` branch, installed in the same Python environment as SGLang.
+- A checkpoint whose routed-expert weights use the MXFP8 layout recognized by this SGLang integration.
+- A validated multi-process launch configuration for the target deployment.
+
+<Warning>
+MegaMoE does not convert an arbitrary checkpoint to MXFP8 at server startup. Prepare and validate the checkpoint before deployment.
+</Warning>
+
+## Install the integrated components
+
+Clone both integration branches from the repositories provided for your deployment:
+
+```bash Command
+git clone --recursive --branch integration/megamoe-mxfp8 "$DEEPGEMM_REPOSITORY" deepgemm
+git clone --branch integration/megamoe-mxfp8 "$SGLANG_REPOSITORY" sglang
+```
+
+Install DeepGEMM and SGLang into the same environment:
+
+```bash Command
+(cd deepgemm && ./install.sh)
+python -m pip install -e sglang/python
+```
+
+Verify that both Python packages resolve from that environment:
+
+```bash Command
+python -c "import deep_gemm, sglang; print('MegaMoE dependencies are available')"
+```
+
+For general SGLang environment setup, see [Installation](/docs/get-started/install).
+
+## Enable MegaMoE
+
+Add the following backend selection to the customer's validated SGLang launch command:
+
+```bash Command
+--moe-a2a-backend megamoe
+```
+
+Keep the existing model path, parallelism, networking, memory, CUDA Graph, and service arguments unchanged unless they have been separately validated for the deployment.
+
+When selected, SGLang aligns the expert-parallel execution group with the tensor-parallel execution group, prepares compatible expert weights during model loading, and uses the integrated MegaMoE path for eligible MoE layers.
+
+## Runtime behavior
+
+The integration keeps routing decisions in SGLang and passes the selected expert assignments, routing weights, hidden states, and prepared expert weights to DeepGEMM. DeepGEMM then performs communication and expert computation through the MegaMoE path before returning the combined hidden states to SGLang.
+
+The backend supports CUDA Graph capture. SGLang reuses the prepared expert views and symmetric communication buffers after initialization instead of rebuilding them for each request.
+
+Backend selection alone is not proof that every MoE layer used MegaMoE. A layer becomes eligible only after compatible expert-weight preparation succeeds. Always verify the active path from service logs and a profiler trace.
+
+## Validate the integration
+
+Use the same checkpoint, prompts, sampling settings, and acceptance policy as the customer's approved reference deployment.
+
+- Start the service and confirm that the log reports `Mega MoE is enabled` without import, JIT compilation, symmetric-memory, or weight-preparation errors.
+- Run the existing correctness suite against both the approved reference backend and MegaMoE.
+- Apply the customer's established output or numerical acceptance criteria. Do not infer model accuracy from successful kernel execution alone.
+- Warm up the service before measuring performance so model loading, JIT compilation, and CUDA Graph capture are outside the steady-state measurement window.
+- Capture a profiler trace and confirm that the MegaMoE kernel executes inside the expected CUDA Graph replay.
+- Exercise the deployment's approved concurrency range and verify request completion, finite outputs, and stable memory usage.
+
+## Troubleshooting
+
+### DeepGEMM cannot be imported
+
+Confirm that DeepGEMM was installed from the matching integration branch and that the server uses the same Python environment. Re-run the import check before launching SGLang.
+
+### Expert weights are not prepared
+
+Check the checkpoint quantization metadata and the model-loading log. The checkpoint must expose the MXFP8 expert data and scale tensors expected by the integration. Do not enable runtime conversion as a substitute for a validated checkpoint.
+
+### Symmetric-memory initialization fails
+
+Verify process membership, device visibility, collective initialization, and interconnect availability across the complete launch group. All participating ranks must initialize the same backend and compatible communication buffers.
+
+### The first request is slow
+
+DeepGEMM kernels are JIT compiled and CUDA Graphs are captured during warmup. Ensure the JIT cache is writable and complete warmup before collecting latency or throughput measurements.
+
+### The profiler shows a different MoE path
+
+Review the model-loading log for weight-preparation warnings and confirm that the launch command selected `megamoe`. Treat an unexpected fallback as a deployment validation failure until its cause is understood.
+
+## Roll back
+
+Remove `--moe-a2a-backend megamoe` from the launch command and restore the backend used by the approved reference deployment. Restart all ranks together so every process uses the same backend selection.
+
+Rollback does not modify checkpoint files. Keep the previous environment and launch manifest available until MegaMoE validation is complete.
