@@ -118,6 +118,12 @@ _is_gfx95_supported = is_gfx95_supported()
 # gfx942 (MI300) has no MX matmul HW; MXFP8 checkpoints are converted to
 # block-fp8 [128,128] at load and run through the native block-fp8 kernels.
 _mxfp8_to_block_fp8_required = mxfp8_block_convert_required()
+
+# Profiling-only storage aliases for models whose full dummy expert checkpoint
+# cannot fit on the requested TP topology. The environment switch is explicit;
+# production and real-checkpoint loading never enter this path.
+_dummy_shared_mxfp8_moe_storage: Dict[tuple, torch.Tensor] = {}
+_dummy_shared_mxfp8_moe_processed_storage: set[tuple] = set()
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
@@ -1062,6 +1068,33 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             is_packed=False,
         )
 
+        share_dummy_mxfp8_storage = get_bool_env_var(
+            "SGLANG_DUMMY_SHARE_MXFP8_MOE_WEIGHTS"
+        )
+        if share_dummy_mxfp8_storage and not (
+            self.use_mxfp8 and self.quant_config.is_checkpoint_fp8_serialized
+        ):
+            raise ValueError(
+                "SGLANG_DUMMY_SHARE_MXFP8_MOE_WEIGHTS requires a serialized "
+                "MXFP8 quantization config and is only intended for dummy profiling"
+            )
+
+        def make_weight_or_scale(
+            name: str,
+            shape: tuple[int, ...],
+            dtype: torch.dtype,
+            initializer=torch.empty,
+        ) -> Parameter:
+            if not share_dummy_mxfp8_storage:
+                return Parameter(initializer(*shape, dtype=dtype), requires_grad=False)
+            device_index = torch.cuda.current_device() if _is_cuda else -1
+            key = (name, shape, dtype, device_index)
+            value = _dummy_shared_mxfp8_moe_storage.get(key)
+            if value is None:
+                value = initializer(*shape, dtype=dtype)
+                _dummy_shared_mxfp8_moe_storage[key] = value
+            return Parameter(value, requires_grad=False)
+
         if self.block_quant:
             block_n, block_k = (
                 self.quant_config.weight_block_size[0],
@@ -1128,23 +1161,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 requires_grad=False,
             )
         else:
-            w13_weight = torch.nn.Parameter(
-                torch.empty(
-                    num_experts,
-                    w13_up_dim,
-                    hidden_size,
-                    dtype=params_dtype,
-                ),
-                requires_grad=False,
+            w13_weight = make_weight_or_scale(
+                "w13_weight",
+                (num_experts, w13_up_dim, hidden_size),
+                params_dtype,
             )
-            w2_weight = torch.nn.Parameter(
-                torch.empty(
-                    num_experts,
-                    hidden_size,
-                    w2_up_dim,
-                    dtype=params_dtype,
-                ),
-                requires_grad=False,
+            w2_weight = make_weight_or_scale(
+                "w2_weight",
+                (num_experts, hidden_size, w2_up_dim),
+                params_dtype,
             )
 
         extra_weight_attrs.update(
@@ -1205,23 +1230,25 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         elif self.block_quant:
             scale_dtype = torch.uint8 if self.use_mxfp8 else torch.float32
             scale_init = torch.zeros if scale_dtype == torch.uint8 else torch.ones
-            w13_weight_scale = torch.nn.Parameter(
-                scale_init(
+            w13_weight_scale = make_weight_or_scale(
+                "w13_weight_scale_inv",
+                (
                     num_experts,
                     2 * ((intermediate_size_per_partition + block_n - 1) // block_n),
                     (hidden_size + block_k - 1) // block_k,
-                    dtype=scale_dtype,
                 ),
-                requires_grad=False,
+                scale_dtype,
+                scale_init,
             )
-            w2_weight_scale = torch.nn.Parameter(
-                scale_init(
+            w2_weight_scale = make_weight_or_scale(
+                "w2_weight_scale_inv",
+                (
                     num_experts,
                     (hidden_size + block_n - 1) // block_n,
                     (intermediate_size_per_partition + block_k - 1) // block_k,
-                    dtype=scale_dtype,
                 ),
-                requires_grad=False,
+                scale_dtype,
+                scale_init,
             )
             # w13_weight and w2_weight are always requanted together
             w13_weight_scale.format_ue8m0 = self.use_mxfp8
@@ -1626,6 +1653,27 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 "(gfx942 converts MXFP8 to block-fp8 at load instead)."
             )
 
+        shared_dummy_storage_key = None
+        if (
+            get_bool_env_var("SGLANG_DUMMY_SHARE_MXFP8_MOE_WEIGHTS")
+            and not quantize
+            and (
+                get_moe_runner_backend().is_flashinfer_trtllm()
+                or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            )
+        ):
+            shared_dummy_storage_key = (
+                layer.w13_weight.data_ptr(),
+                layer.w2_weight.data_ptr(),
+                layer.w13_weight_scale_inv.data_ptr(),
+                layer.w2_weight_scale_inv.data_ptr(),
+            )
+            if (
+                shared_dummy_storage_key
+                in _dummy_shared_mxfp8_moe_processed_storage
+            ):
+                return
+
         def _quantize_and_swizzle_with_cutlass_es_kernel(weight: torch.Tensor):
             from sgl_kernel import es_sm100_mxfp8_blockscaled_grouped_quant
 
@@ -1926,6 +1974,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
 
             align_mxfp8_moe_weights_for_flashinfer_trtllm(layer)
+            if shared_dummy_storage_key is not None:
+                _dummy_shared_mxfp8_moe_processed_storage.add(
+                    shared_dummy_storage_key
+                )
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if _is_hip and _use_hip_int4:
