@@ -29,6 +29,14 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 class ForwardMetadata:
     query_start_loc: torch.Tensor
     mamba_cache_indices: torch.Tensor
+    # MIXED batches are laid out as [prefill tokens, decode tokens], with one
+    # token per decode request.  These fields are prepared once per forward so
+    # every GDN layer can dispatch split kernels without a GPU->CPU sync or a
+    # per-layer cu_seqlens rebase kernel.
+    num_mixed_prefill_reqs: int = 0
+    num_mixed_prefill_tokens: int = 0
+    num_mixed_decode_reqs: int = 0
+    mixed_decode_query_start_loc: Optional[torch.Tensor] = None
     mamba_cache_indices_gdn: Optional[torch.Tensor] = None
     # Mamba track DESTINATION slots (PHYSICAL, length == batch). Like
     # mamba_cache_indices: a backend-owned static buffer under cuda-graph (translated

@@ -409,7 +409,9 @@ class FutureMap:
                 draft_input.bonus_tokens, self.output_tokens_buf, indices
             )
 
-    def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
+    def resolve_seq_lens_cpu(
+        self, batch: ScheduleBatch, *, force_cpu: bool = False
+    ) -> None:
         # Lazy pull from new_seq_lens_buf for spec_v2 (accept_lens not known to
         # schedule). The CPU mirror is gated by needs_cpu_seq_lens; backends that
         # opt out take the GPU-only path below. A private D2H stream overlaps the copy.
@@ -433,7 +435,7 @@ class FutureMap:
                 self.publish_ready.wait()
         batch.seq_lens = self.new_seq_lens_buf[fi]
 
-        if not self.needs_cpu_seq_lens:
+        if not self.needs_cpu_seq_lens and not force_cpu:
             # GPU gather above is kept (SB.seq_lens must advance each verify);
             # skip the .cpu() D2H. Downstream takes the GPU-only path.
             batch.seq_lens_cpu = None
@@ -444,6 +446,13 @@ class FutureMap:
                 # re-publish is fenced behind this stream via wait_stream).
                 _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
             return
+
+        # Mixed chunk with speculative decoding allocates one ordinary target
+        # token for each resident request before the prefill forward. Paged KV
+        # allocation still consumes the host mirror, even when the attention
+        # backend normally runs with GPU-only sequence lengths. ``force_cpu``
+        # lets that infrequent admission path pull the freshly published
+        # lengths without putting a D2H back into the steady-state decode loop.
 
         if self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
             batch.seq_lens_cpu = batch.seq_lens.cpu()  # bootstrap / non-CUDA

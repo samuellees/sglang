@@ -1,0 +1,118 @@
+name: tp16-prefill-bcg-decode-full-pareto-cc1-128
+
+# Replace the placeholder runtime and scheduler settings for your environment.
+model:
+  path: MODEL_PATH
+  container: sglang-runtime
+  precision: fp8
+
+identity:
+  container:
+    image: CONTAINER_IMAGE
+  frameworks:
+    sglang: 0.0.0
+
+frontend:
+  type: sglang
+  enable_multiple_frontends: false
+
+resources:
+  gpu_type: gb300
+  gpus_per_node: 4
+  agg_nodes: 4
+  agg_workers: 1
+
+slurm:
+  account: your-account
+  partition: your-partition
+  time_limit: "08:00:00"
+
+sbatch_directives:
+  qos: normal
+  # Keep all four TP16 trays in one NVL72 topology domain.
+  segment: "4"
+
+extra_mount: []
+
+health_check:
+  max_attempts: 1080
+  interval_seconds: 10
+
+backend:
+  type: sglang
+
+  aggregated_environment:
+    PYTHONNOUSERSITE: "1"
+    PYTHONUNBUFFERED: "1"
+    SGLANG_FLASHINFER_AUTOTUNE_CACHE: "1"
+    # Keep the GDN projection-unpack/Conv1D fusion explicit in benchmark
+    # recipes even though the CUDA implementation defaults to enabled.
+    SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV: "1"
+    SGLANG_GDN_DECODE_FUSION_LOG_LAYER_HITS: "1"
+
+  sglang_config:
+    aggregated:
+      served-model-name: benchmark-model
+      trust-remote-code: true
+      quantization: fp8
+
+      tensor-parallel-size: 16
+      expert-parallel-size: 1
+
+      context-length: 12288
+      mem-fraction-static: 0.8
+      max-running-requests: 128
+      chunked-prefill-size: 8192
+      max-prefill-tokens: 8192
+      page-size: 64
+      disable-radix-cache: true
+
+      attention-backend: trtllm_mha
+      linear-attn-prefill-backend: flashinfer
+      linear-attn-decode-backend: flashinfer
+      moe-runner-backend: flashinfer_trtllm
+      moe-a2a-backend: none
+
+      # Use the measured FlashInfer split-K tactics for allowlisted TP16
+      # low-M BF16 GEMMs. Larger and unmeasured shapes keep the existing
+      # SGLang TGV/cuBLAS dispatch.
+      bf16-gemm-backend: flashinfer_pr4266
+
+      mamba-radix-cache-strategy: extra_buffer
+      mamba-ssm-dtype: bfloat16
+
+      # MTP is disabled because no speculative decoding configuration is set.
+      flashinfer-allreduce-fusion-backend: mnnvl
+
+      weight-loader-prefetch-checkpoints: true
+      weight-loader-prefetch-num-threads: 4
+
+      cuda-graph-backend-prefill: breakable
+      cuda-graph-max-bs-prefill: 8192
+      cuda-graph-backend-decode: full
+      cuda-graph-max-bs-decode: 128
+      cuda-graph-bs-decode:
+        - 1
+        - 2
+        - 4
+        - 8
+        - 16
+        - 32
+        - 64
+        - 128
+
+      decode-log-interval: 1
+      enable-cache-report: true
+      watchdog-timeout: 900
+
+benchmark:
+  type: sa-bench
+  dataset_name: random
+  isl: 8192
+  osl: 1024
+  concurrencies: 1x2x4x8x16x32x64x128
+  req_rate: inf
+  random_range_ratio: 1
+  num_prompts_mult: 5
+  num_warmup_mult: 2
+  use_chat_template: false

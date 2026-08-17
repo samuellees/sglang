@@ -121,6 +121,32 @@ MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY = 1
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_BUFFER = 1
 
+
+def _pp_local_per_request_bytes(
+    total_bytes: int,
+    layer_ids: list[int],
+    start_layer: int,
+    end_layer: int,
+) -> int:
+    """Scale a layer-linear state cost to the current PP stage.
+
+    ``BaseLinearStateParams`` reports bytes for every linear-attention layer in
+    the model config, while the PP memory pools below allocate only layers in
+    ``[start_layer, end_layer)``.  Budgeting the global value makes the error
+    grow with PP size and can reject configurations whose real local pools fit.
+    """
+    if not layer_ids:
+        return 0
+    if total_bytes % len(layer_ids) != 0:
+        raise ValueError(
+            "Linear-state bytes must be uniform per layer: "
+            f"total_bytes={total_bytes}, num_layers={len(layer_ids)}"
+        )
+    local_layer_count = sum(
+        start_layer <= layer_id < end_layer for layer_id in layer_ids
+    )
+    return total_bytes // len(layer_ids) * local_layer_count
+
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.mem_cache.unified_memory_pool import (
@@ -1805,6 +1831,24 @@ class KVCacheConfigurator:
         server_args = self.server_args
         assert config is not None
 
+        cache_params = config.mamba2_cache_params
+        mamba_cache_per_req = _pp_local_per_request_bytes(
+            cache_params.mamba_cache_per_req,
+            cache_params.layers,
+            self.layer_info.start_layer,
+            self.layer_info.end_layer,
+        )
+        if self.server_args.pp_size > 1:
+            logger.info(
+                "PP-local Mamba budget: layers=%d/%d, state=%.2f MB/request",
+                sum(
+                    self.layer_info.start_layer <= layer_id < self.layer_info.end_layer
+                    for layer_id in cache_params.layers
+                ),
+                len(cache_params.layers),
+                mamba_cache_per_req / (1 << 20),
+            )
+
         has_spec_dec = not self.spec_algorithm.is_none()
         # ReplaySSM drops the per-step intermediate_ssm scratch, so its mamba budget
         # no longer reserves the (1 + D/ratio) intermediate factor -- the whole
@@ -1825,10 +1869,11 @@ class KVCacheConfigurator:
                 record_len = server_args.max_speculative_num_draft_tokens
             else:
                 record_len = get_exec().mamba.linear_replayssm_cache_len
-            replayssm_ring_per_req = (
-                config.mamba2_cache_params.replayssm_ring_bytes_per_req(
-                    record_len=record_len
-                )
+            replayssm_ring_per_req = _pp_local_per_request_bytes(
+                cache_params.replayssm_ring_bytes_per_req(record_len=record_len),
+                cache_params.layers,
+                self.layer_info.start_layer,
+                self.layer_info.end_layer,
             )
         else:
             replayssm_ring_per_req = 0
@@ -1853,7 +1898,7 @@ class KVCacheConfigurator:
                     get_schedule().max_mamba_cache_size // ratio,
                 )
                 intermediate_size = (
-                    config.mamba2_cache_params.mamba_cache_per_req
+                    mamba_cache_per_req
                     * (capped_reqs + 1)
                     * get_spec().speculative_num_draft_tokens
                 )
@@ -1872,15 +1917,15 @@ class KVCacheConfigurator:
             # pool's padding slot). Skipped under replayssm.
             if has_spec_dec and not replayssm_active:
                 intermediate_size = (
-                    config.mamba2_cache_params.mamba_cache_per_req
+                    mamba_cache_per_req
                     * (get_schedule().max_mamba_cache_size + 1)
                     * get_spec().speculative_num_draft_tokens
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         else:
             # Use ratio-based calculation to auto-fit available memory
-            assert config.mamba2_cache_params.mamba_cache_per_req > 0
-            per_req = config.mamba2_cache_params.mamba_cache_per_req
+            assert mamba_cache_per_req > 0
+            per_req = mamba_cache_per_req
 
             # Solve jointly for max_mamba_cache_size (K), including the pool's
             # +1 padding slot on both buffers (see memory_pool.py):
@@ -1929,7 +1974,7 @@ class KVCacheConfigurator:
                 f"Not enough GPU memory for hybrid (mamba/linear-attention) state cache. "
                 f"Computed max_mamba_cache_size={get_schedule().max_mamba_cache_size} "
                 f"(total_rest_memory={total_rest_memory:.2f} GB, "
-                f"mamba_cache_per_req={config.mamba2_cache_params.mamba_cache_per_req / (1 << 20):.2f} MB). "
+                f"mamba_cache_per_req={mamba_cache_per_req / (1 << 20):.2f} MB). "
                 f"Try: (1) reduce --max-running-requests, "
                 f"(2) increase --mem-fraction-static, "
                 f"(3) reduce --speculative-num-draft-tokens, or "
@@ -1941,7 +1986,7 @@ class KVCacheConfigurator:
         # the ring is not allocated).
         mamba_state_memory = (
             (get_schedule().max_mamba_cache_size + 1)
-            * (config.mamba2_cache_params.mamba_cache_per_req + replayssm_ring_per_req)
+            * (mamba_cache_per_req + replayssm_ring_per_req)
             / (1 << 30)
         )
         return total_rest_memory - mamba_state_memory

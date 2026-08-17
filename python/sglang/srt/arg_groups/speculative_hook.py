@@ -551,14 +551,33 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             "speculative decoding."
         )
 
-    if server_args.enable_mixed_chunk:
-        server_args.enable_mixed_chunk = False
-        logger.warning(
-            "Mixed chunked prefill is disabled because of using "
-            "eagle speculative decoding."
-        )
-
     model_arch = server_args.get_model_config().hf_config.architectures[0]
+    if server_args.enable_mixed_chunk:
+        supports_mixed_chunk = (
+            server_args.speculative_algorithm == "EAGLE"
+            and model_arch
+            in {
+                "Qwen3_5ForCausalLM",
+                "Qwen3_5MoeForCausalLM",
+            }
+            and server_args.speculative_eagle_topk in (None, 1)
+            and server_args.enable_linear_replayssm_spec
+        )
+        if supports_mixed_chunk:
+            logger.info(
+                "Mixed chunked prefill is enabled for Qwen3.5 EAGLE/NextN "
+                "with topk=1. Resident requests take one target decode step "
+                "inside the mixed batch and refresh their draft state through "
+                "the normal draft-extend path."
+            )
+        else:
+            server_args.enable_mixed_chunk = False
+            logger.warning(
+                "Mixed chunked prefill is disabled for this eagle speculative "
+                "configuration. It is currently supported only for Qwen3.5 "
+                "EAGLE/NextN with topk=1 and ReplaySSM spec enabled."
+            )
+
     if model_arch in [
         "DeepseekV32ForCausalLM",
         "DeepseekV3ForCausalLM",

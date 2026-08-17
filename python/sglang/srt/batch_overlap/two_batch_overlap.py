@@ -756,6 +756,13 @@ class TboForwardBatchPreparer:
             output_dict["input_ids"], output_dict["forward_mode"]
         )
 
+        # MIXED batches are ordered as [prefill requests, decode requests].
+        # Preserve the decode-tail geometry when TBO slices the request axis.
+        mixed_prefill_bs = batch.batch_size - batch.mixed_decode_batch_size
+        mixed_decode_batch_size = max(
+            0, end_seq_index - max(start_seq_index, mixed_prefill_bs)
+        )
+
         # TODO improve, e.g. unify w/ `init_raw`
         if (
             get_parallel().moe_dense_tp_size == 1
@@ -775,6 +782,7 @@ class TboForwardBatchPreparer:
                     else None
                 ),
                 extend_num_tokens=extend_num_tokens,
+                mixed_decode_batch_size=mixed_decode_batch_size,
                 num_token_non_padded=out_num_token_non_padded,
                 # TODO: handle it when we need TBO + DeepSeek V3.2
                 num_token_non_padded_cpu=None,

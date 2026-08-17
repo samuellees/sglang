@@ -223,9 +223,29 @@ class MambaAttnBackendBase(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode=}")
 
+        num_mixed_decode_reqs = forward_batch.mixed_decode_batch_size
+        num_mixed_prefill_reqs = 0
+        num_mixed_prefill_tokens = 0
+        mixed_decode_query_start_loc = None
+        if num_mixed_decode_reqs > 0:
+            num_mixed_prefill_reqs = bs - num_mixed_decode_reqs
+            num_mixed_prefill_tokens = (
+                forward_batch.extend_num_tokens - num_mixed_decode_reqs
+            )
+            # SGLang V0 places prefill rows first and the appended single-token
+            # decode rows last.  Rebase the tail cu_seqlens once here instead
+            # of launching this subtraction once per GDN layer.
+            mixed_decode_query_start_loc = (
+                query_start_loc[num_mixed_prefill_reqs:] - num_mixed_prefill_tokens
+            )
+
         return ForwardMetadata(
             query_start_loc=query_start_loc,
             mamba_cache_indices=mamba_cache_indices,
+            num_mixed_prefill_reqs=num_mixed_prefill_reqs,
+            num_mixed_prefill_tokens=num_mixed_prefill_tokens,
+            num_mixed_decode_reqs=num_mixed_decode_reqs,
+            mixed_decode_query_start_loc=mixed_decode_query_start_loc,
             # Physical track destinations (None when tracking off); cuda-graph
             # supplies this via the static backend buffer in _replay_metadata.
             mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),

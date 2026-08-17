@@ -60,8 +60,20 @@ if TYPE_CHECKING:
 # Default workspace size in MB for TRTLLM MHA
 # Can be configured via SGLANG_FLASHINFER_WORKSPACE_SIZE environment variable
 DEFAULT_WORKSPACE_SIZE_MB = 512
+TRTLLM_GEN_ALIGNMENT_BYTES = 32
+INT32_BYTES = 4
 
 # Reuse this workspace buffer across all TRTLLM MHA wrappers
+
+
+@dataclass(frozen=True)
+class TRTLLMMHAMixedBatchLayout:
+    """Host-known split of SGLang's [prefill, decode] MIXED token layout."""
+
+    prefill_batch_size: int
+    prefill_num_tokens: int
+    prefill_max_seq_len_q: int
+    decode_batch_size: int
 
 
 @dataclass
@@ -90,6 +102,75 @@ class TRTLLMMHAMetadata:
     encoder_cache_seqlens: torch.Tensor = None
     encoder_page_table: torch.Tensor = None
     encoder_row_map: torch.Tensor = None
+    mixed_batch_layout: Optional[TRTLLMMHAMixedBatchLayout] = None
+    # MIXED stores resident decode rows after the prefill rows. A suffix view
+    # can therefore start at an address that does not satisfy TRTLLM-GEN
+    # decode's alignment contract. Sequence lengths use a forward-owned copy;
+    # page-table storage uses a padded row stride so its suffix stays aligned.
+    mixed_decode_cache_seqlens_int32: torch.Tensor = None
+    mixed_decode_page_table: torch.Tensor = None
+    mixed_decode_swa_page_table: torch.Tensor = None
+    mixed_decode_cu_seqlens_q: torch.Tensor = None
+    mixed_decode_cu_seqlens_k: torch.Tensor = None
+
+
+def should_use_context_for_mixed_decode(
+    num_query_heads: int, num_kv_heads: int
+) -> bool:
+    """Keep high-local-GQA MIXED batches on one context-FMHA launch.
+
+    The direct decode kernel remains faster and stable for the TP16 layout of
+    Qwen3.5 Max (four local query heads per KV head).  With wider local GQA,
+    observed in the DP4 x TP4 layout, launching context FMHA followed by decode
+    FMHA in one MIXED forward can fault asynchronously.  Splitting the same
+    high-GQA batch into two independent context launches is also not state
+    equivalent across repeated admissions.  Use the legacy, correctness-proven
+    full MIXED context launch for this geometry.  Pure decode forwards and the
+    TP16 direct split retain their original kernels.
+    """
+
+    if num_kv_heads <= 0:
+        raise ValueError(f"num_kv_heads must be positive, got {num_kv_heads}")
+    return num_query_heads > 4 * num_kv_heads
+
+
+def resolve_trtllm_mha_mixed_batch_layout(
+    forward_batch: ForwardBatch,
+) -> Optional[TRTLLMMHAMixedBatchLayout]:
+    """Validate and resolve the scheduler's MIXED tail without a device sync."""
+
+    if not forward_batch.forward_mode.is_mixed():
+        return None
+
+    decode_batch_size = forward_batch.mixed_decode_batch_size
+    if decode_batch_size < 0 or decode_batch_size > forward_batch.batch_size:
+        raise ValueError(
+            "Invalid MIXED decode batch size: "
+            f"{decode_batch_size=} {forward_batch.batch_size=}"
+        )
+
+    extend_seq_lens = forward_batch.extend_seq_lens_cpu
+    if extend_seq_lens is None or len(extend_seq_lens) != forward_batch.batch_size:
+        raise ValueError(
+            "TRTLLM MHA MIXED attention requires one host extend length per "
+            f"request, got {extend_seq_lens=} {forward_batch.batch_size=}"
+        )
+
+    prefill_batch_size = forward_batch.batch_size - decode_batch_size
+    prefill_lens = extend_seq_lens[:prefill_batch_size]
+    decode_lens = extend_seq_lens[prefill_batch_size:]
+    if any(seq_len != 1 for seq_len in decode_lens):
+        raise ValueError(
+            "SGLang MIXED attention expects one token per appended decode "
+            f"request, got trailing lengths {decode_lens}"
+        )
+
+    return TRTLLMMHAMixedBatchLayout(
+        prefill_batch_size=prefill_batch_size,
+        prefill_num_tokens=sum(prefill_lens),
+        prefill_max_seq_len_q=max(prefill_lens, default=1),
+        decode_batch_size=decode_batch_size,
+    )
 
 
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
@@ -158,6 +239,40 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 device=model_runner.device,
             ),
         )
+        # A MIXED forward invokes the context and decode TRTLLM-GEN kernels in
+        # the same model layer.  FlashInfer treats the workspace as kernel
+        # scratch state, so reusing the context workspace for the immediately
+        # following decode launch can corrupt that launch (and, depending on
+        # timing, surface as an illegal-address fault).  Give only the mixed
+        # decode slice a second workspace.  Pure prefill and pure decode keep
+        # the original buffer and therefore retain their memory/performance
+        # behavior when mixed chunk is disabled.
+        if model_runner.server_args.enable_mixed_chunk:
+            def mixed_decode_workspace_factory():
+                return torch.zeros(
+                    self.workspace_size,
+                    dtype=torch.uint8,
+                    device=model_runner.device,
+                )
+
+            if (
+                model_runner.server_args.enable_two_batch_overlap
+                and not model_runner.is_draft_worker
+            ):
+                # TBO constructs a primary backend plus two children and may
+                # execute the children on different CUDA streams. A process-
+                # global workspace is not safe for their mixed-decode kernels;
+                # each backend instance must own its scratch storage.
+                self._mixed_decode_workspace_buffer = (
+                    mixed_decode_workspace_factory()
+                )
+            else:
+                self._mixed_decode_workspace_buffer = get_buffer(
+                    "trtllm_mha_mixed_decode_workspace",
+                    mixed_decode_workspace_factory,
+                )
+        else:
+            self._mixed_decode_workspace_buffer = self.workspace_buffer
 
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}
@@ -190,12 +305,23 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         else:
             self._swa_full_to_swa_mapping = None
 
-        # Static page-table width (upper bound). The CUDA-graph path builds the
-        # page table on-device sized to this constant, so it never reads a runtime
-        # max. See _fill_page_table_device.
-        self.max_num_pages = (
+        # Static page-table width (upper bound). Pad every row to a 32-byte
+        # boundary so a mixed-decode suffix remains aligned without copying
+        # the potentially multi-megabyte table on every mixed forward. The
+        # kernels consume explicit tensor strides, and the extra columns are
+        # never addressed because sequence lengths retain the true KV length.
+        raw_max_num_pages = (
             self.max_context_len + self.page_size - 1
         ) // self.page_size
+        if model_runner.server_args.enable_mixed_chunk:
+            page_table_alignment_elements = TRTLLM_GEN_ALIGNMENT_BYTES // INT32_BYTES
+            self.max_num_pages = (
+                (raw_max_num_pages + page_table_alignment_elements - 1)
+                // page_table_alignment_elements
+                * page_table_alignment_elements
+            )
+        else:
+            self.max_num_pages = raw_max_num_pages
 
         # Forward metadata
         self.forward_metadata: Optional[TRTLLMMHAMetadata] = None
@@ -913,6 +1039,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """Initialize the metadata for a forward pass."""
 
         metadata = TRTLLMMHAMetadata()
+        metadata.mixed_batch_layout = resolve_trtllm_mha_mixed_batch_layout(
+            forward_batch
+        )
         seqlens_in_batch = forward_batch.seq_lens
         batch_size = forward_batch.batch_size
         device = seqlens_in_batch.device
@@ -1013,6 +1142,27 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self._fill_page_table_device(
             metadata, forward_batch.req_pool_indices, metadata.cache_seqlens_int32
         )
+
+        mixed_layout = metadata.mixed_batch_layout
+        if mixed_layout is not None and mixed_layout.decode_batch_size > 0:
+            split = mixed_layout.prefill_batch_size
+            # Sequence lengths are small and need their own aligned allocation.
+            # Page-table rows are already 32-byte padded, so suffix views are
+            # aligned and keep their forward-owned base allocation alive.
+            metadata.mixed_decode_cache_seqlens_int32 = (
+                metadata.cache_seqlens_int32[split:].clone()
+            )
+            metadata.mixed_decode_page_table = metadata.page_table[split:]
+            metadata.mixed_decode_cu_seqlens_q = (
+                metadata.cu_seqlens_q[split:] - metadata.cu_seqlens_q[split]
+            )
+            metadata.mixed_decode_cu_seqlens_k = (
+                metadata.cu_seqlens_k[split:] - metadata.cu_seqlens_k[split]
+            )
+            if metadata.swa_page_table is not None:
+                metadata.mixed_decode_swa_page_table = metadata.swa_page_table[
+                    split:
+                ]
         self._maybe_build_cp_zigzag_page_tables(metadata, forward_batch)
 
         if self._needs_encoder_only_expand(forward_batch.forward_mode, metadata):
@@ -1334,10 +1484,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 max_seqlen_q,
                 *,
                 cu_seqlens_kv,
+                block_tables=None,
                 use_zigzag_page_table=False,
                 out=None,
+                skip_softmax_threshold_scale_factor=None,
             ):
-                block_tables = page_table
+                if block_tables is None:
+                    block_tables = page_table
                 if use_zigzag_page_table:
                     block_tables = self.forward_metadata.zigzag_page_table
                     zigzag_swa_pt = self.forward_metadata.zigzag_swa_page_table
@@ -1360,7 +1513,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     cum_seq_lens_kv=cu_seqlens_kv,
                     window_left=layer.sliding_window_size,
                     sinks=attention_sink,
-                    skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
+                    skip_softmax_threshold_scale_factor=(
+                        envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get()
+                        if skip_softmax_threshold_scale_factor is None
+                        else skip_softmax_threshold_scale_factor
+                    ),
                     out=out,
                     out_dtype=self.q_data_type,
                 )
@@ -1376,17 +1533,126 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     attention_backend=CPAttentionBackendKind.TRTLLM_MHA,
                 )
             else:
+                mixed_layout = self.forward_metadata.mixed_batch_layout
                 out = forward_batch._attn_output
                 if out is not None:
                     out = out.view_as(q)
-                o = _trtllm_context_attn(
-                    q,
-                    self.forward_metadata.cu_seqlens_q,
-                    self.forward_metadata.cache_seqlens_int32,
-                    self.forward_metadata.max_seq_len_q,
-                    cu_seqlens_kv=self.forward_metadata.cu_seqlens_k,
-                    out=out,
+                use_full_mixed_context = (
+                    mixed_layout is not None
+                    and mixed_layout.decode_batch_size > 0
+                    and should_use_context_for_mixed_decode(
+                        layer.tp_q_head_num, layer.tp_k_head_num
+                    )
                 )
+                if (
+                    mixed_layout is None
+                    or mixed_layout.decode_batch_size == 0
+                    or use_full_mixed_context
+                ):
+                    o = _trtllm_context_attn(
+                        q,
+                        self.forward_metadata.cu_seqlens_q,
+                        self.forward_metadata.cache_seqlens_int32,
+                        self.forward_metadata.max_seq_len_q,
+                        cu_seqlens_kv=self.forward_metadata.cu_seqlens_k,
+                        out=out,
+                    )
+                else:
+                    prefill_bs = mixed_layout.prefill_batch_size
+                    prefill_num_tokens = mixed_layout.prefill_num_tokens
+                    outputs = []
+
+                    if prefill_bs > 0:
+                        outputs.append(
+                            _trtllm_context_attn(
+                                q[:prefill_num_tokens],
+                                self.forward_metadata.cu_seqlens_q[: prefill_bs + 1],
+                                self.forward_metadata.cache_seqlens_int32[:prefill_bs],
+                                mixed_layout.prefill_max_seq_len_q,
+                                cu_seqlens_kv=self.forward_metadata.cu_seqlens_k[
+                                    : prefill_bs + 1
+                                ],
+                                block_tables=page_table[:prefill_bs],
+                                out=(
+                                    out[:prefill_num_tokens]
+                                    if out is not None
+                                    else None
+                                ),
+                            )
+                        )
+
+                    decode_q = q[prefill_num_tokens:]
+                    if self.is_xqa_impl:
+                        decode_q = decode_q.contiguous()
+                    decode_page_table = (
+                        self.forward_metadata.mixed_decode_swa_page_table
+                        if page_table is self.forward_metadata.swa_page_table
+                        else self.forward_metadata.mixed_decode_page_table
+                    )
+                    if should_use_context_for_mixed_decode(
+                        layer.tp_q_head_num, layer.tp_k_head_num
+                    ):
+                        outputs.append(
+                            _trtllm_context_attn(
+                                decode_q,
+                                self.forward_metadata.mixed_decode_cu_seqlens_q,
+                                self.forward_metadata.mixed_decode_cache_seqlens_int32,
+                                1,
+                                cu_seqlens_kv=(
+                                    self.forward_metadata.mixed_decode_cu_seqlens_k
+                                ),
+                                block_tables=decode_page_table,
+                                out=(
+                                    out[prefill_num_tokens:]
+                                    if out is not None
+                                    else None
+                                ),
+                                skip_softmax_threshold_scale_factor=(
+                                    envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get()
+                                ),
+                            )
+                        )
+                    else:
+                        outputs.append(
+                            flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+                                query=decode_q,
+                                kv_cache=kv_cache,
+                                workspace_buffer=self._mixed_decode_workspace_buffer,
+                                block_tables=decode_page_table,
+                                seq_lens=(
+                                    self.forward_metadata.mixed_decode_cache_seqlens_int32
+                                ),
+                                max_seq_len=self.max_context_len,
+                                bmm1_scale=bmm1_scale,
+                                bmm2_scale=bmm2_scale,
+                                window_left=layer.sliding_window_size,
+                                sinks=attention_sink,
+                                skip_softmax_threshold_scale_factor=(
+                                    envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get()
+                                ),
+                                out_dtype=self.q_data_type,
+                                # Do not let mixed decode carve its multi-CTA
+                                # counters out of ``workspace_buffer``: the
+                                # context-attention launch immediately above also
+                                # uses that workspace. Reuse the dedicated,
+                                # zero-initialized counter buffer just like the
+                                # normal decode and speculative-decode paths do.
+                                multi_ctas_kv_counter_buffer=(
+                                    self._multi_ctas_kv_counter_buffer
+                                ),
+                            )
+                        )
+                    if out is None:
+                        o = (
+                            outputs[0]
+                            if len(outputs) == 1
+                            else torch.cat(outputs, dim=0)
+                        )
+                    else:
+                        if prefill_bs > 0 and outputs[0].data_ptr() != out.data_ptr():
+                            out[:prefill_num_tokens].copy_(outputs[0])
+                        out[prefill_num_tokens:].copy_(outputs[-1])
+                        o = out
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 

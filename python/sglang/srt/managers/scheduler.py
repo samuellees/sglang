@@ -93,7 +93,7 @@ from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
-from sglang.srt.layers.moe import initialize_moe_config
+from sglang.srt.layers.moe import get_moe_a2a_backend, initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
@@ -1741,6 +1741,9 @@ class Scheduler(
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
+            need_flashinfer_mtp_phase_sync = self._needs_flashinfer_mtp_phase_sync(
+                batch, last_batch=self.last_batch
+            )
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(
                 batch, last_batch=self.last_batch
             )
@@ -1748,6 +1751,15 @@ class Scheduler(
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
             if disable_overlap_for_batch:
+                if need_flashinfer_mtp_phase_sync:
+                    # ``process_batch_result`` can recycle buffers referenced by
+                    # the previous MTP target/draft graph.  Its copy event only
+                    # fences the D2H leaf stream, not the complete forward.  Drain
+                    # the forward stream before processing the result when the
+                    # transport switches between one-sided decode and AG+RS
+                    # extend.  This is a boundary-only host wait; steady decode
+                    # retains normal scheduler/GPU overlap.
+                    self.forward_stream.synchronize()
                 pop_and_process()
                 # Opportunistic flush at the disable_overlap sync boundary:
                 # forward_stream is idle (prev forward drained, next not launched),
@@ -1818,11 +1830,65 @@ class Scheduler(
             and len(self.result_queue) > 0
         )
 
+        # FlashInfer's one-sided MoE transport is CUDA-Graph safe during
+        # steady decode, but an MTP target/draft graph must be drained before
+        # an eager extend starts (and vice versa). Otherwise the next eager
+        # kernel can observe an asynchronous illegal-memory access from the
+        # in-flight graph when a DP replica reaches its max local batch.
+        # Process the pending result only at the phase boundary; decode->decode
+        # and extend->extend retain normal scheduler/GPU overlap.
+        need_flashinfer_mtp_phase_sync = self._needs_flashinfer_mtp_phase_sync(
+            batch, last_batch
+        )
+
+        # The speculative worker publishes target seq_lens before its draft
+        # extend completes.  Resolving those seq_lens while constructing a
+        # MIXED batch therefore does not drain DeepEPv2's asynchronous draft
+        # dispatch/combine buffers.  Reusing them in the next global extend can
+        # silently corrupt the resident recurrent state (decode -> MIXED) or
+        # deadlock (MIXED -> MIXED).  Serialize only entry into a speculative
+        # global extend for this backend; steady-state decode remains fully
+        # overlapped.
+        need_deepep_v2_mixed_prefill_sync = (
+            self.is_mixed_chunk
+            and batch is not None
+            and last_batch is not None
+            and not batch.spec_algorithm.is_none()
+            and get_moe_a2a_backend().is_deepep_v2()
+            and batch_is_extend
+        )
+
         # Algorithms that support grammar overlap advance the FSM inside verify()
         # via the grammar barrier (overlapping the target forward), which resolves
         # whatever result is still pending in the queue — including the
         # extend->decode boundary — so no grammar-specific overlap disable is needed.
-        return disable_overlap_for_batch or need_grammar_sync
+        return (
+            disable_overlap_for_batch
+            or need_grammar_sync
+            or need_flashinfer_mtp_phase_sync
+            or need_deepep_v2_mixed_prefill_sync
+        )
+
+    def _needs_flashinfer_mtp_phase_sync(
+        self, batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
+    ) -> bool:
+        """Whether an MTP batch crosses the FlashInfer transport boundary."""
+
+        if (
+            batch is None
+            or last_batch is None
+            or batch.spec_algorithm.is_none()
+            or not get_moe_a2a_backend().is_flashinfer()
+        ):
+            return False
+
+        if self.require_mlp_sync:
+            batch_is_extend = batch.is_extend_in_batch
+            last_batch_is_extend = last_batch.is_extend_in_batch
+        else:
+            batch_is_extend = batch.forward_mode.is_extend()
+            last_batch_is_extend = last_batch.forward_mode.is_extend()
+        return batch_is_extend != last_batch_is_extend
 
     def _advance_pending_grammar(self):
         """Grammar barrier (spec-v2 overlap): advance the FSM over any not-yet
@@ -3341,7 +3407,26 @@ class Scheduler(
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             running_batch.filter_batch()
             if not running_batch.is_empty():
-                running_batch.prepare_for_decode()
+                if not running_batch.spec_algorithm.is_none():
+                    if self.enable_overlap:
+                        # The spec overlap fast path normally keeps sequence
+                        # lengths GPU-only. Resolve the latest published verify
+                        # result and materialize its CPU mirror here because the
+                        # paged one-token allocation below requires it. This is
+                        # paid only when a new prefill batch is admitted, not on
+                        # steady-state decode iterations.
+                        self.future_map.resolve_seq_lens_cpu(
+                            running_batch, force_cpu=True
+                        )
+                    if running_batch.seq_lens_cpu is None:
+                        # Bootstrap batches do not yet carry future indices, so
+                        # resolve_seq_lens_cpu has nothing to consume. Their GPU
+                        # tensor is already authoritative.
+                        running_batch.seq_lens_cpu = running_batch.seq_lens.cpu()
+                        running_batch.seq_lens_sum = int(
+                            running_batch.seq_lens_cpu.sum()
+                        )
+                running_batch.prepare_for_decode(for_mixed_chunk=True)
                 new_batch.mix_with_running(running_batch)
                 new_batch.decoding_reqs = running_batch.reqs
             running_batch = ScheduleBatch(

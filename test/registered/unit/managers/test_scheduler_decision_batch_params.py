@@ -1,5 +1,7 @@
 import inspect
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
@@ -46,6 +48,114 @@ class TestDecisionMethodsHaveNoHiddenBatchChannel(unittest.TestCase):
                         "explicitly and return it via NextBatchPlan instead."
                     ),
                 )
+
+
+class TestFlashinferMtpPhaseSync(unittest.TestCase):
+    @staticmethod
+    def _batch(*, is_extend: bool, is_speculative: bool = True):
+        return SimpleNamespace(
+            is_extend_in_batch=is_extend,
+            forward_mode=SimpleNamespace(is_extend=lambda: is_extend),
+            spec_algorithm=SimpleNamespace(is_none=lambda: not is_speculative),
+        )
+
+    def _scheduler(self, *, require_mlp_sync: bool):
+        scheduler = object.__new__(Scheduler)
+        scheduler.require_mlp_sync = require_mlp_sync
+        return scheduler
+
+    @patch("sglang.srt.managers.scheduler.get_moe_a2a_backend")
+    def test_syncs_only_at_mtp_phase_crossing(self, get_backend):
+        get_backend.return_value.is_flashinfer.return_value = True
+        scheduler = self._scheduler(require_mlp_sync=True)
+        extend = self._batch(is_extend=True)
+        decode = self._batch(is_extend=False)
+
+        self.assertTrue(scheduler._needs_flashinfer_mtp_phase_sync(decode, extend))
+        self.assertTrue(scheduler._needs_flashinfer_mtp_phase_sync(extend, decode))
+        self.assertFalse(scheduler._needs_flashinfer_mtp_phase_sync(decode, decode))
+
+    @patch("sglang.srt.managers.scheduler.get_moe_a2a_backend")
+    def test_skips_non_mtp_and_non_flashinfer(self, get_backend):
+        scheduler = self._scheduler(require_mlp_sync=False)
+        extend = self._batch(is_extend=True)
+        decode = self._batch(is_extend=False)
+
+        get_backend.return_value.is_flashinfer.return_value = False
+        self.assertFalse(scheduler._needs_flashinfer_mtp_phase_sync(decode, extend))
+
+        get_backend.return_value.is_flashinfer.return_value = True
+        non_mtp_decode = self._batch(is_extend=False, is_speculative=False)
+        self.assertFalse(
+            scheduler._needs_flashinfer_mtp_phase_sync(non_mtp_decode, extend)
+        )
+
+
+class TestDeepEPV2MixedPrefillSync(unittest.TestCase):
+    @staticmethod
+    def _batch(*, is_extend: bool, is_speculative: bool = True):
+        return SimpleNamespace(
+            is_extend_in_batch=is_extend,
+            forward_mode=SimpleNamespace(
+                is_extend=lambda: is_extend,
+                is_decode=lambda: not is_extend,
+            ),
+            spec_algorithm=SimpleNamespace(is_none=lambda: not is_speculative),
+            grammar_needs_sync=lambda: False,
+        )
+
+    @staticmethod
+    def _scheduler(*, is_mixed_chunk: bool = True):
+        scheduler = object.__new__(Scheduler)
+        scheduler.require_mlp_sync = True
+        scheduler.is_mixed_chunk = is_mixed_chunk
+        scheduler.result_queue = []
+        return scheduler
+
+    @patch("sglang.srt.managers.scheduler.envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP")
+    @patch("sglang.srt.managers.scheduler.get_moe_a2a_backend")
+    def test_syncs_entry_to_speculative_mixed_extend(
+        self, get_backend, disable_prefill_overlap
+    ):
+        disable_prefill_overlap.get.return_value = False
+        get_backend.return_value.is_deepep_v2.return_value = True
+        get_backend.return_value.is_flashinfer.return_value = False
+        scheduler = self._scheduler()
+        extend = self._batch(is_extend=True)
+        decode = self._batch(is_extend=False)
+
+        self.assertTrue(scheduler.is_disable_overlap_for_batch(extend, extend))
+        self.assertTrue(scheduler.is_disable_overlap_for_batch(extend, decode))
+        self.assertFalse(scheduler.is_disable_overlap_for_batch(decode, extend))
+        self.assertFalse(scheduler.is_disable_overlap_for_batch(decode, decode))
+
+    @patch("sglang.srt.managers.scheduler.envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP")
+    @patch("sglang.srt.managers.scheduler.get_moe_a2a_backend")
+    def test_skips_non_mixed_non_speculative_and_non_deepep_v2(
+        self, get_backend, disable_prefill_overlap
+    ):
+        disable_prefill_overlap.get.return_value = False
+        get_backend.return_value.is_flashinfer.return_value = False
+        extend = self._batch(is_extend=True)
+
+        get_backend.return_value.is_deepep_v2.return_value = False
+        self.assertFalse(
+            self._scheduler().is_disable_overlap_for_batch(extend, extend)
+        )
+
+        get_backend.return_value.is_deepep_v2.return_value = True
+        self.assertFalse(
+            self._scheduler(is_mixed_chunk=False).is_disable_overlap_for_batch(
+                extend, extend
+            )
+        )
+
+        non_speculative = self._batch(is_extend=True, is_speculative=False)
+        self.assertFalse(
+            self._scheduler().is_disable_overlap_for_batch(
+                non_speculative, extend
+            )
+        )
 
 
 if __name__ == "__main__":

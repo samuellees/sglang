@@ -2946,9 +2946,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             latest_output_ids
         )
 
-    def prepare_for_decode(self):
+    def prepare_for_decode(self, *, for_mixed_chunk: bool = False):
         self.forward_mode = ForwardMode.DECODE
         server_args = get_server_args()
+        is_mixed_spec_decode = for_mixed_chunk and not self.spec_algorithm.is_none()
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
@@ -2957,14 +2958,34 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
             self.attn_cp_metadata = None
 
-        if not self.spec_algorithm.is_none():
+        if not self.spec_algorithm.is_none() and not for_mixed_chunk:
             # Spec decoding owns decode preparation (allocation, seq-lens bookkeeping).
             from sglang.srt.speculative.spec_utils import spec_prepare_for_decode
 
             spec_prepare_for_decode(self)
             return
 
-        if self.sampling_info.penalizer_orchestrator.is_required:
+        if is_mixed_spec_decode:
+            # A mixed Qwen3.5 EAGLE batch is executed by the worker's prefill
+            # path. Resident requests therefore contribute exactly one target
+            # token, then the common draft-extend pass rebuilds their draft
+            # state together with the newly admitted requests. Prepare those
+            # resident rows like plain decode instead of reserving a speculative
+            # verify tree (which has no out_cache_loc for the MIXED forward).
+            assert (
+                self.spec_algorithm.is_eagle()
+                and not self.spec_algorithm.is_frozen_kv_mtp()
+            )
+
+            # Keep the normal speculative reserve/accounting. The resident
+            # target token below is written into that already-owned tail. Using
+            # alloc_for_decode here would bump kv_allocated_len even when the
+            # physical page was preallocated by EAGLE, and release_kv_cache
+            # would later free stale entries beyond the real allocation.
+            from sglang.srt.speculative.spec_utils import spec_prepare_for_decode
+
+            spec_prepare_for_decode(self)
+        elif self.sampling_info.penalizer_orchestrator.is_required:
             self.cumulate_penalty_output_tokens()
 
         # input_ids is set at end of previous run_batch (placeholder for
@@ -2975,11 +2996,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Allocate memory (DSV4-NPU c{4,128}_state alloc lens are computed inside
         # the allocator, triggered from mem_cache/common.py.)
-        self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
+        if is_mixed_spec_decode:
+            assert all(
+                seq_len < req.kv.kv_allocated_len
+                for seq_len, req in zip(self.seq_lens_cpu.tolist(), self.reqs)
+            ), "Mixed speculative decode token must fit in the EAGLE KV reserve"
+            self.out_cache_loc = self.req_to_token_pool.req_to_token[
+                self.req_pool_indices, self.seq_lens
+            ]
+        else:
+            self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
 
         # Update req-level memory management fields
         for req in self.reqs:
-            req.decode_batch_idx += 1
+            if not is_mixed_spec_decode:
+                req.decode_batch_idx += 1
             req.kv_committed_len += 1
 
         # New-tensor avoids racing model_worker_batch refs queued for
